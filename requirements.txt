@@ -3,6 +3,6 @@ uvicorn[standard]==0.24.0
 websockets==12.0
 google-cloud-speech==2.21.0
 python-multipart==0.0.6
-numpy==1.24.3
+numpy>=1.26.0
 aiohttp==3.9.1
 aiosmtplib==3.0.1
