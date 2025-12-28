@@ -762,14 +762,32 @@ app = FastAPI(
     redoc_url="/redoc"
 )
 
-# CORS middleware configured for production deployment
+# CORS middleware configured for production deployment and Chrome extensions
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],  # Allow all origins for Chrome extension compatibility
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS", "HEAD", "PATCH"],
+    allow_headers=[
+        "Accept",
+        "Accept-Language",
+        "Content-Language",
+        "Content-Type",
+        "Authorization",
+        "X-Requested-With",
+        "Origin",
+        "Access-Control-Request-Method",
+        "Access-Control-Request-Headers",
+    ],
+    expose_headers=["*"],
+    max_age=86400,  # 24 hours
 )
+
+# Explicit OPTIONS handler for Chrome extension preflight requests
+@app.options("/{path:path}")
+async def options_handler(path: str):
+    """Handle preflight OPTIONS requests for Chrome extensions"""
+    return {"message": "OK"}
 
 @app.get("/")
 async def root():
