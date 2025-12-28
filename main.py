@@ -778,6 +778,12 @@ app.add_middleware(
         "Origin",
         "Access-Control-Request-Method",
         "Access-Control-Request-Headers",
+        "Sec-WebSocket-Key",
+        "Sec-WebSocket-Version",
+        "Sec-WebSocket-Protocol",
+        "Sec-WebSocket-Extensions",
+        "Connection",
+        "Upgrade",
     ],
     expose_headers=["*"],
     max_age=86400,  # 24 hours
@@ -1008,10 +1014,10 @@ async def websocket_audio_stream(websocket: WebSocket):
 
 if __name__ == "__main__":
     # Production deployment - Railway uses Procfile, this is for local development only
-    port = int(os.environ.get("PORT", 8006))  # SE Insight standard port, Railway overrides
+    port = int(os.environ.get("PORT", 8080))  # Railway default port, fallback for local development
     
-    logger.info("🚀 Starting SE Insight Railway Backend (Local Development)")
-    logger.info(f"📡 Port: {port}")
+    logger.info("🚀 Starting SE Insight Railway Backend")
+    logger.info(f"📡 Port: {port} (Railway: {bool(os.environ.get('RAILWAY_ENVIRONMENT'))})")
     logger.info(f"🔑 Google API: {'Available' if GOOGLE_CLOUD_AVAILABLE else 'Not Available'}")
     logger.info(f"🔐 GCP Key: {'Configured' if os.environ.get('GCP_KEY_JSON') else 'Not Configured'}")
     logger.info(f"🤖 Gemini API: {'Configured' if os.environ.get('GEMINI_API_KEY') else 'Not Configured'}")
