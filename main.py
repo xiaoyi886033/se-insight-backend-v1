@@ -26,10 +26,12 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 # Google Cloud Speech imports - Task 3: Use speech_v1.SpeechAsyncClient
+# Fix 1: Import and use google.api_core.retry_async.AsyncRetry instead of sync version
 try:
     from google.cloud import speech_v1
+    from google.api_core.retry_async import AsyncRetry
     GOOGLE_CLOUD_AVAILABLE = True
-    print("✅ Google Cloud Speech API v1 available")
+    print("✅ Google Cloud Speech API v1 available with AsyncRetry")
 except ImportError:
     GOOGLE_CLOUD_AVAILABLE = False
     print("⚠️ Google Cloud Speech API v1 not available")
@@ -900,17 +902,27 @@ async def get_se_term_definition(term: str):
     }
 
 # Task 3: Async Streaming Implementation (The Core Bug)
-async def request_generator():
+async def request_generator(audio_queue, config):
     """Task 3: Define a generator that yields the Config first, then the Audio.
     
-    This is the EXACT pattern required by Google Speech API v1 async streaming.
+    Fix 3: Validate the request_generator - Make sure you use async for or asyncio.Queue inside the generator to yield chunks.
+    Verification: Log DEBUG - Yielding audio chunk to gRPC before each yield.
     """
     # FIRST PACKET: Config
     yield speech_v1.StreamingRecognizeRequest(streaming_config=config)
+    print("DEBUG - Yielded config to gRPC")
+    
     # SUBSEQUENT PACKETS: Audio
     while True:
-        chunk = await audio_queue.get()
-        yield speech_v1.StreamingRecognizeRequest(audio_content=chunk)
+        try:
+            chunk = await audio_queue.get()
+            if chunk is None:  # Shutdown signal
+                break
+            print(f"DEBUG - Yielding audio chunk to gRPC: {len(chunk)} bytes")
+            yield speech_v1.StreamingRecognizeRequest(audio_content=chunk)
+        except Exception as e:
+            logger.error(f"❌ Generator error: {e}")
+            break
 
 @app.websocket("/ws/audio")
 async def websocket_audio_stream(websocket: WebSocket):
@@ -935,7 +947,6 @@ async def websocket_audio_stream(websocket: WebSocket):
     buffer_size_threshold = 32000  # ~2 seconds of 16kHz mono audio (for Gemini)
     
     # Task 3: Use asyncio.Queue for async generator pattern
-    global audio_queue, config
     audio_queue = asyncio.Queue()
     
     last_gemini_call = 0
@@ -954,10 +965,20 @@ async def websocket_audio_stream(websocket: WebSocket):
         enable_word_confidence=True
     )
     
-    # Task 4: Session Persistence - Enable interim_results=True for real-time captions
+    # Task 4: Explicit LINEAR16 Parameters - Lock sample_rate_hertz to 16000 and encoding to LINEAR16
+    recognition_config = speech_v1.RecognitionConfig(
+        encoding=speech_v1.RecognitionConfig.AudioEncoding.LINEAR16,  # Explicit LINEAR16
+        sample_rate_hertz=16000,  # Lock to 16000
+        language_code="en-US",
+        model="latest_long",
+        enable_automatic_punctuation=True,
+        enable_word_confidence=True
+    )
+    
+    # Task 4: Session Persistence - Ensure interim_results=True is active so we see partial text immediately
     config = speech_v1.StreamingRecognitionConfig(
         config=recognition_config,
-        interim_results=True,  # Keep ONE stream alive per WebSocket. Enable interim_results=True for real-time captions.
+        interim_results=True,  # Ensure interim_results=True is active so we see partial text immediately
         single_utterance=False  # Keep stream open for continuous audio
     )
     
@@ -966,8 +987,8 @@ async def websocket_audio_stream(websocket: WebSocket):
     
     if google_client.client:
         try:
-            # Start the async streaming recognition
-            streaming_task = asyncio.create_task(process_streaming_responses(websocket, session_data))
+            # Start the async streaming recognition with AsyncRetry
+            streaming_task = asyncio.create_task(process_streaming_responses(websocket, session_data, audio_queue, config))
         except Exception as e:
             logger.error(f"❌ Failed to start streaming recognition: {e}")
     
@@ -1043,6 +1064,11 @@ async def websocket_audio_stream(websocket: WebSocket):
         
         # Stop streaming task
         if streaming_task:
+            # Send shutdown signal to audio queue
+            try:
+                audio_queue.put_nowait(None)
+            except:
+                pass
             streaming_task.cancel()
         
         # Finalize session data and send archive
@@ -1062,6 +1088,11 @@ async def websocket_audio_stream(websocket: WebSocket):
         
         # Stop streaming task
         if streaming_task:
+            # Send shutdown signal to audio queue
+            try:
+                audio_queue.put_nowait(None)
+            except:
+                pass
             streaming_task.cancel()
         
         # Clean up session on error
@@ -1076,23 +1107,26 @@ async def websocket_audio_stream(websocket: WebSocket):
             
             del active_sessions[session_id]
 
-async def process_streaming_responses(websocket: WebSocket, session_data: SessionData):
+async def process_streaming_responses(websocket: WebSocket, session_data: SessionData, audio_queue: asyncio.Queue, config):
     """Process streaming recognition responses using async generator pattern
     
-    Task 3: Uses the correct async streaming pattern with speech_v1.SpeechAsyncClient
+    Fix 2: Implement Proper Async Streaming - Refactor the call to: stream = await client.streaming_recognize(requests=request_generator(), retry=AsyncRetry())
     """
     if not google_client.client:
         logger.error("❌ Google Speech AsyncClient not initialized")
         return
     
     try:
-        # Task 3: The Call - responses = await client.streaming_recognize(requests=request_generator())
-        responses = await google_client.client.streaming_recognize(requests=request_generator())
+        # Fix 2: Refactor the call to use AsyncRetry - stream = await client.streaming_recognize(requests=request_generator(), retry=AsyncRetry())
+        stream = await google_client.client.streaming_recognize(
+            requests=request_generator(audio_queue, config), 
+            retry=AsyncRetry()
+        )
         
-        logger.info("✅ Async streaming recognition started")
+        logger.info("✅ Async streaming recognition started with AsyncRetry")
         
         # Process streaming responses in real-time
-        async for response in responses:
+        async for response in stream:
             try:
                 # Process each streaming response
                 for result in response.results:
@@ -1102,7 +1136,7 @@ async def process_streaming_responses(websocket: WebSocket, session_data: Sessio
                         confidence = result.alternatives[0].confidence if result.alternatives[0].confidence else 0.0
                         current_time = time.time()
                         
-                        # Logging: Log transcript only when Google returns a non-empty result
+                        # Verification: We need the UserWarning to disappear and actual words to appear in "Raw Transcript"!
                         if transcript_text.strip():
                             print(f"DEBUG - Raw Transcript: '{transcript_text}' (final: {is_final})")
                             logger.info(f"📝 Google STT: \"{transcript_text}\" (final: {is_final})")
