@@ -933,14 +933,14 @@ async def websocket_audio_stream(websocket: WebSocket):
     # Dynamic audio configuration from client
     client_sample_rate = 16000  # Default, will be updated from start_session
     
-    # Streaming Recognition Setup - Persistent Stream with Session Context
-    streaming_generator = None
+    # Single Session: Create ONE streaming_recognize session per WebSocket connection
     streaming_responses = None
     stream_initialized = False
     
-    def create_streaming_generator():
-        """Create persistent streaming request generator"""
-        # First Message: Send StreamingRecognitionConfig ONCE per WebSocket connection
+    # Generator Pattern: Use async generator to yield audio chunks into the stream
+    async def audio_chunk_generator():
+        """Async generator that yields audio chunks to maintain persistent bi-directional stream"""
+        # Packet 1: StreamingRecognitionConfig (send only once)
         recognition_config = speech.RecognitionConfig(
             encoding=speech.RecognitionConfig.AudioEncoding.LINEAR16,
             sample_rate_hertz=16000,
@@ -952,22 +952,31 @@ async def websocket_audio_stream(websocket: WebSocket):
         
         streaming_config = speech.StreamingRecognitionConfig(
             config=recognition_config,
-            interim_results=True,  # Enable interim results for real-time feedback
+            interim_results=True,  # This is the ONLY way to get real-time subtitles before a sentence is finished
             single_utterance=False  # Keep stream open for continuous audio
         )
         
-        # Yield the config first
+        # Handshake Rule: First packet sends StreamingRecognitionConfig
         yield speech.StreamingRecognizeRequest(streaming_config=streaming_config)
+        logger.info("✅ Sent StreamingRecognitionConfig (Packet 1)")
         
-        # Then yield audio chunks from the queue
+        # Packet 2-N: StreamingRecognizeRequest(audio_content=chunk)
         while True:
             try:
-                # Get audio chunk from queue (blocking within generator)
-                chunk_data = stt_chunk_queue.get_nowait()
+                # Wait for aggregated chunk from queue
+                chunk_data = await stt_chunk_queue.get()
                 if chunk_data is None:  # Shutdown signal
                     break
                     
                 chunk_to_process, current_time = chunk_data
+                sample_count = len(chunk_to_process) // 2
+                
+                # Logging: Keep the DEBUG log for verification
+                print(f"DEBUG - Sending Chunk: {sample_count} samples")
+                
+                if sample_count < 1600:
+                    logger.warning(f"⚠️ Chunk too small: {sample_count} samples < 1600 minimum")
+                    continue
                 
                 # Audio Encoding Validation: Double-check int16 conversion
                 import numpy as np
@@ -978,19 +987,16 @@ async def websocket_audio_stream(websocket: WebSocket):
                 except Exception as clip_error:
                     logger.warning(f"Audio clipping validation failed: {clip_error}")
                 
-                # Subsequent Messages: Stream ONLY raw audio bytes
+                # Yield audio chunk to maintain persistent stream
                 yield speech.StreamingRecognizeRequest(audio_content=chunk_to_process)
                 
-            except asyncio.QueueEmpty:
-                # No audio available, continue waiting
-                continue
             except Exception as gen_error:
-                logger.error(f"❌ Streaming generator error: {gen_error}")
+                logger.error(f"❌ Audio generator error: {gen_error}")
                 break
     
     # Create async task for processing streaming responses
     async def process_streaming_responses():
-        """Process streaming recognition responses asynchronously"""
+        """Process streaming recognition responses from persistent bi-directional stream"""
         nonlocal streaming_responses, last_gemini_call, audio_buffer, stream_initialized
         
         if not google_client.client:
@@ -999,12 +1005,12 @@ async def websocket_audio_stream(websocket: WebSocket):
         
         try:
             # Initialize streaming recognition with persistent generator
-            streaming_generator = create_streaming_generator()
-            streaming_responses = google_client.client.streaming_recognize(streaming_generator)
+            audio_generator = audio_chunk_generator()
+            streaming_responses = google_client.client.streaming_recognize(audio_generator)
             stream_initialized = True
-            logger.info("✅ Streaming recognition initialized with persistent session")
+            logger.info("✅ Persistent bi-directional stream initialized")
             
-            # Process streaming responses
+            # Process streaming responses in real-time
             for response in streaming_responses:
                 try:
                     # Process each streaming response
@@ -1015,11 +1021,11 @@ async def websocket_audio_stream(websocket: WebSocket):
                             confidence = result.alternatives[0].confidence if result.alternatives[0].confidence else 0.0
                             current_time = time.time()
                             
-                            # Output Logic: Log transcript immediately (even if not final)
-                            print(f"DEBUG - Raw Transcript: '{transcript_text}' (final: {is_final})")
-                            logger.info(f"📝 Google STT: \"{transcript_text}\" (final: {is_final})")
-                            
+                            # Logging: Log transcript only when Google returns a non-empty result
                             if transcript_text.strip():
+                                print(f"DEBUG - Raw Transcript: '{transcript_text}' (final: {is_final})")
+                                logger.info(f"📝 Google STT: \"{transcript_text}\" (final: {is_final})")
+                                
                                 # Process SE terms and Gemini analysis
                                 detected_terms = se_knowledge_base.detect_se_terms(transcript_text)
                                 
@@ -1080,38 +1086,7 @@ async def websocket_audio_stream(websocket: WebSocket):
             logger.error(f"❌ Streaming recognition error: {streaming_error}")
             stream_initialized = False
     
-    # Create async task for feeding audio chunks to the streaming queue
-    async def process_audio_chunks():
-        """Process aggregated audio chunks and feed to streaming recognition"""
-        while True:
-            try:
-                # Wait for aggregated chunk from main queue (non-blocking)
-                chunk_data = await stt_chunk_queue.get()
-                if chunk_data is None:  # Shutdown signal
-                    break
-                
-                chunk_to_process, current_time = chunk_data
-                
-                # Strict 100ms Chunking (Google v1 Spec): Process the 3,200 bytes (1,600 samples)
-                sample_count = len(chunk_to_process) // 2
-                
-                # Logging: Keep the DEBUG log for verification
-                print(f"DEBUG - Sending Chunk: {sample_count} samples")
-                
-                if sample_count < 1600:
-                    logger.warning(f"⚠️ Chunk too small: {sample_count} samples < 1600 minimum")
-                    continue
-                
-                # The chunk will be processed by the streaming generator
-                # Mark task as done
-                stt_chunk_queue.task_done()
-                
-            except Exception as e:
-                logger.error(f"❌ Audio chunk processing error: {e}")
-                await asyncio.sleep(0.1)  # Brief pause before continuing
-    
-    # Start the audio processing tasks
-    audio_task = asyncio.create_task(process_audio_chunks())
+    # Start the streaming response processing task
     streaming_task = asyncio.create_task(process_streaming_responses())
     
     logger.info(f"🔌 WebSocket client connected: {client_id} (Session: {session_id})")
