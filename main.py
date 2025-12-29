@@ -962,34 +962,41 @@ async def websocket_audio_stream(websocket: WebSocket):
                         continue
                 
                 if "bytes" in message:
-                    # Process audio data - FORCE Int16 Conversion
+                    # Process audio data - Bit-Depth Transform Logic
                     audio_data = message["bytes"]
                     logger.debug(f"📨 Received {len(audio_data)} bytes from {client_id}")
                     
-                    # CRITICAL: If incoming bytes are Float32 from browser, convert to Int16
-                    # Browser may send Float32, but Google STT requires Int16 (LINEAR16)
+                    # Bit-Depth Transform: Treat incoming bytes as Float32Array first
                     import numpy as np
                     try:
-                        # Assume incoming data might be Float32, convert to Int16
-                        if len(audio_data) % 4 == 0:  # Float32 = 4 bytes per sample
-                            float32_array = np.frombuffer(audio_data, dtype=np.float32)
-                            # Convert Float32 [-1.0, 1.0] to Int16 [-32768, 32767]
-                            int16_array = (float32_array * 32767).astype(np.int16)
-                            audio_data = int16_array.tobytes()
-                            logger.debug(f"🔄 Converted Float32 to Int16: {len(float32_array)} samples")
-                        # If already Int16 (2 bytes per sample), use as-is
-                    except Exception as conv_error:
-                        logger.warning(f"⚠️ Audio conversion error: {conv_error}")
+                        # Extension may send Float32 data, convert to Int16 for Google STT
+                        float32_samples = np.frombuffer(audio_data, dtype=np.float32)
+                        
+                        # Apply scaling formula: int16_samples = (float32_samples * 32767).astype(np.int16)
+                        int16_samples = (float32_samples * 32767).astype(np.int16)
+                        audio_data = int16_samples.tobytes()
+                        
+                        logger.debug(f"🔄 Float32 to Int16 conversion: {len(float32_samples)} samples")
+                        
+                    except Exception as transform_error:
+                        # If not Float32, try as Int16 directly
+                        logger.debug(f"⚠️ Float32 conversion failed, using raw bytes: {transform_error}")
                     
                     # Add to buffer for Gemini processing
                     audio_buffer.extend(audio_data)
                     
-                    # Add Volume Diagnostics: Log audio volume using numpy
+                    # Add Volume Diagnostics: Log audio volume using numpy for Int16 data
                     try:
                         import numpy as np
+                        # Extension sends Int16 PCM data, so interpret as Int16
                         audio_array = np.frombuffer(audio_data, dtype=np.int16)
                         avg_amplitude = np.abs(audio_array).mean()
                         print(f"DEBUG - Audio Volume: {avg_amplitude}")
+                        
+                        # Verify we're receiving valid Int16 data
+                        if len(audio_array) > 0:
+                            max_val = np.max(np.abs(audio_array))
+                            print(f"DEBUG - Max Int16 Value: {max_val} (should be <= 32767)")
                     except Exception as vol_error:
                         print(f"DEBUG - Audio Volume: [calculation error: {vol_error}]")
                     
@@ -1018,14 +1025,14 @@ async def websocket_audio_stream(websocket: WebSocket):
                         continue
                     
                     try:
-                        # Configure audio for Google Speech API - LOCKED CONFIG
+                        # Explicit RecognitionConfig (v1 Spec) - Google Cloud STT v1 technical specifications
                         audio = speech.RecognitionAudio(content=bytes(audio_data))
                         config = speech.RecognitionConfig(
-                            encoding=speech.RecognitionConfig.AudioEncoding.LINEAR16,  # LOCKED
-                            sample_rate_hertz=16000,  # LOCKED to 16000 (not dynamic)
-                            language_code="en-US",  # LOCKED
-                            enable_automatic_punctuation=True,  # Explicit config
-                            model="latest_long"  # Force recognition model for YouTube streams
+                            encoding=speech.RecognitionConfig.AudioEncoding.LINEAR16,
+                            sample_rate_hertz=16000,  # Must match your frontend's output
+                            language_code="en-US",
+                            enable_automatic_punctuation=True,
+                            model="latest_long"  # Optimized for continuous video audio
                         )
                         
                         # Call Google Speech API
