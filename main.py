@@ -998,16 +998,8 @@ async def websocket_audio_stream(websocket: WebSocket):
                         "gemini_analysis": None
                     }
                     
-                    # Add SE term definitions for frontend (PO3)
-                    for term in detected_terms:
-                        term_def = se_knowledge_base.get_term_definition(term)
-                        if term_def:
-                            response_data["se_definitions"][term] = {
-                                "definition": term_def.definition,
-                                "category": term_def.category,
-                                "examples": term_def.examples[:2],  # Limit for performance
-                                "related_terms": term_def.related_terms[:3]  # Limit for performance
-                            }
+                    # SE definitions only populated when Gemini API returns matches
+                    # Screen remains clean unless Gemini API successfully returns a match
                     
                     # Add Gemini analysis with Chinese explanations (PO3)
                     if result.gemini_analysis:
