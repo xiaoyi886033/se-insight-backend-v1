@@ -104,14 +104,14 @@ class GeminiAPIService:
             self.is_configured = False
             return
             
-        self.api_url = "https://generativelanguage.googleapis.com/v1/models/gemini-3-flash:generateContent"
+        self.api_url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-3-flash:generateContent"
         
         # Optimized system instruction for gemini-3-flash real-time processing
         self.system_instruction = """You are a Senior Software Engineering Professor analyzing real-time transcripts. Detect specialized SE terms (e.g., polymorphism, CI/CD, microservices, algorithms) and provide concise Chinese explanations (under 40 words). Return JSON format: {"original_text": "...", "keywords": [{"term": "term_name", "explanation": "Chinese_explanation"}]}. Empty keywords list if no SE terms found. No conversational text."""
         
-        # Buffer mechanism to prevent too-frequent API calls
+        # Buffer mechanism to prevent too-frequent API calls (15 RPM rate limit)
         self.last_analysis_time = 0
-        self.min_interval = 2.0  # Minimum 2 seconds between Gemini API calls
+        self.min_interval = 2.0  # Minimum 2 seconds between Gemini API calls (stays within 15 RPM)
         self.pending_transcripts = []
         
         self.is_configured = True
