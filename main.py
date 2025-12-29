@@ -104,7 +104,7 @@ class GeminiAPIService:
             self.is_configured = False
             return
             
-        self.api_url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent"
+        self.api_url = "https://generativelanguage.googleapis.com/v1/models/gemini-1.5-flash:generateContent"
         
         # Optimized system instruction for gemini-1.5-flash real-time processing
         self.system_instruction = """You are a Senior Software Engineering Professor analyzing real-time transcripts. Detect specialized SE terms (e.g., polymorphism, CI/CD, microservices, algorithms) and provide concise Chinese explanations (under 40 words). Return JSON format: {"original_text": "...", "keywords": [{"term": "term_name", "explanation": "Chinese_explanation"}]}. Empty keywords list if no SE terms found. No conversational text."""
@@ -559,19 +559,27 @@ class EmailArchivalService:
             html_part = MIMEText(html_body, 'html')
             msg.attach(html_part)
             
-            # Send email using aiosmtplib (async)
-            await aiosmtplib.send(
-                msg,
-                hostname=self.smtp_server,
-                port=self.smtp_port,
-                start_tls=True,
-                username=self.email_user,
-                password=self.email_password,
-            )
-            
-            logger.info(f"📧 Session archive sent successfully to {self.recipient_email}")
-            return True
-            
+            # Send email using aiosmtplib (async) with timeout protection
+            try:
+                await asyncio.wait_for(
+                    aiosmtplib.send(
+                        msg,
+                        hostname=self.smtp_server,
+                        port=self.smtp_port,
+                        start_tls=True,
+                        username=self.email_user,
+                        password=self.email_password,
+                    ),
+                    timeout=10.0  # 10 second timeout to prevent WebSocket blocking
+                )
+                
+                logger.info(f"📧 Session archive sent successfully to {self.recipient_email}")
+                return True
+                
+            except asyncio.TimeoutError:
+                logger.warning("📧 Email sending timeout - continuing without blocking WebSocket")
+                return False
+                
         except ImportError:
             logger.error("❌ aiosmtplib not available - install with: pip install aiosmtplib")
             return False
