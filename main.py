@@ -947,75 +947,114 @@ async def websocket_audio_stream(websocket: WebSocket):
                         (current_time - last_gemini_call) >= gemini_interval
                     )
                     
-                    # TODO: Implement Google Speech API streaming recognition
-                    # For now, simulate transcription with SE term detection
-                    mock_text = "This is a demonstration of API design patterns and microservices architecture using Docker containers"
-                    is_final = True  # Simulate final transcript
+                    # TASK 1: Google Cloud STT (v1) - Real transcription with LINEAR16 encoding
+                    if not google_client.client:
+                        logger.error("❌ Google Speech client not initialized - skipping transcription")
+                        continue
                     
-                    # Detect SE terminology in transcription
-                    detected_terms = se_knowledge_base.detect_se_terms(mock_text)
+                    try:
+                        # Configure audio for Google Speech API (LINEAR16, 16000Hz)
+                        audio = speech.RecognitionAudio(content=bytes(audio_data))
+                        config = speech.RecognitionConfig(
+                            encoding=speech.RecognitionConfig.AudioEncoding.LINEAR16,
+                            sample_rate_hertz=16000,
+                            language_code="en-US",
+                            enable_automatic_punctuation=True,
+                            model="latest_long"
+                        )
+                        
+                        # Call Google Speech API
+                        response = google_client.client.recognize(config=config, audio=audio)
+                        
+                        # Extract actual transcript from Google
+                        transcript_text = ""
+                        is_final = False
+                        confidence = 0.0
+                        
+                        if response.results:
+                            result = response.results[0]
+                            if result.alternatives:
+                                transcript_text = result.alternatives[0].transcript
+                                confidence = result.alternatives[0].confidence
+                                is_final = True
+                                logger.info(f"📝 Google STT Transcript: \"{transcript_text}\"")
+                        
+                        # VALIDATION: Only proceed if we have actual transcript
+                        if not transcript_text.strip():
+                            logger.debug("⚠️ No transcript from Google STT - skipping Gemini")
+                            continue
+                            
+                    except Exception as e:
+                        logger.error(f"❌ Google Speech API error: {e}")
+                        continue
                     
-                    # Get Gemini analysis ONLY when buffer conditions are met
+                    # Detect SE terminology in REAL transcription
+                    detected_terms = se_knowledge_base.detect_se_terms(transcript_text)
+                    
+                    # TASK 2: Gemini 2.0 Flash (v1beta) - ONLY pass real transcript
                     gemini_analysis = None
-                    if should_process_gemini and is_final and mock_text.strip():
+                    if should_process_gemini and is_final and transcript_text.strip():
                         try:
-                            gemini_analysis = await gemini_service.analyze_transcript(mock_text)
+                            # STRICT: Only pass real transcript from STT to Gemini
+                            gemini_analysis = await gemini_service.analyze_transcript(transcript_text)
                             if gemini_analysis:
-                                logger.info(f"🤖 Gemini analysis: {len(gemini_analysis.keywords)} Chinese explanations")
+                                logger.info(f"🤖 Gemini 2.0 Flash analysis: {len(gemini_analysis.keywords)} Chinese explanations")
                             
                             # Reset buffer and timer after successful Gemini call
                             audio_buffer.clear()
                             last_gemini_call = current_time
                             
                         except Exception as e:
-                            logger.error(f"❌ Gemini analysis failed: {e}")
+                            logger.error(f"❌ Gemini 2.0 Flash analysis failed: {e}")
                     
-                    # Update session data
-                    if mock_text:
-                        session_data.transcripts.append(mock_text)
+                    # Update session data with REAL transcript
+                    if transcript_text:
+                        session_data.transcripts.append(transcript_text)
                         session_data.se_terms_detected.extend(detected_terms)
                         session_data.se_terms_detected = list(set(session_data.se_terms_detected))  # Remove duplicates
                     
-                    # Create transcription result with SE terms and Gemini analysis
+                    # Create transcription result with REAL data
                     result = TranscriptionResult(
-                        text=mock_text,
+                        text=transcript_text,
                         is_final=is_final,
-                        confidence=0.85,
+                        confidence=confidence,
                         timestamp=time.time(),
                         se_terms=detected_terms,
                         gemini_analysis=gemini_analysis
                     )
+                        timestamp=time.time(),
+                        se_terms=detected_terms,
+                        gemini_analysis=gemini_analysis
                     
-                    # Prepare response with SE term definitions and Gemini analysis
-                    response_data = {
-                        "type": "transcription_result",
-                        "text": result.text,
-                        "is_final": result.is_final,
-                        "confidence": result.confidence,
-                        "timestamp": result.timestamp,
-                        "se_terms": result.se_terms,
-                        "se_definitions": {},
-                        "gemini_analysis": None
-                    }
-                    
-                    # SE definitions only populated when Gemini API returns matches
-                    # Screen remains clean unless Gemini API successfully returns a match
-                    
-                    # Add Gemini analysis with Chinese explanations (PO3)
-                    if result.gemini_analysis:
-                        response_data["gemini_analysis"] = {
-                            "original_text": result.gemini_analysis.original_text,
-                            "keywords": [
-                                {
-                                    "term": keyword.term,
-                                    "explanation": keyword.explanation
-                                }
-                                for keyword in result.gemini_analysis.keywords
-                            ]
+                    # TASK 3: WebSocket Data Alignment - Send ONLY if Gemini returns valid explanation
+                    if gemini_analysis and gemini_analysis.keywords:
+                        # Only send data when Gemini has valid explanations for detected terms
+                        response_data = {
+                            "type": "transcription_result",
+                            "text": result.text,
+                            "is_final": result.is_final,
+                            "confidence": result.confidence,
+                            "timestamp": result.timestamp,
+                            "se_terms": result.se_terms,
+                            "se_definitions": {},
+                            "gemini_analysis": {
+                                "original_text": gemini_analysis.original_text,
+                                "keywords": [
+                                    {
+                                        "term": keyword.term,
+                                        "explanation": keyword.explanation
+                                    }
+                                    for keyword in gemini_analysis.keywords
+                                ]
+                            }
                         }
-                    
-                    # Send result back to extension
-                    await websocket.send_text(json.dumps(response_data))
+                        
+                        # Send result to frontend
+                        await websocket.send_text(json.dumps(response_data))
+                        logger.info(f"📤 Sent transcription with {len(gemini_analysis.keywords)} Gemini explanations")
+                    else:
+                        # No valid Gemini explanations - do not send to frontend
+                        logger.debug(f"⚠️ No Gemini explanations for transcript: \"{transcript_text}\" - not sending to frontend")
                     
                 elif "text" in message:
                     # Handle control messages from extension
