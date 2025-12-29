@@ -148,6 +148,8 @@ class GeminiAPIService:
             prompt = f"{self.system_instruction}\n\nTranscript to analyze: {transcript_text}"
             
             # Prepare request payload for Gemini API
+            # MIME Check: Audio chunk should be base64 encoded with MIME type audio/pcm; rate=16000
+            # (Note: This is text analysis, not audio - audio MIME handled in WebSocket)
             payload = {
                 "contents": [{
                     "parts": [{
@@ -959,8 +961,8 @@ async def websocket_audio_stream(websocket: WebSocket):
                             encoding=speech.RecognitionConfig.AudioEncoding.LINEAR16,
                             sample_rate_hertz=16000,
                             language_code="en-US",
-                            enable_automatic_punctuation=True,
-                            model="latest_long"
+                            enable_automatic_punctuation=True,  # Explicit config
+                            model="latest_long"  # Force recognition model
                         )
                         
                         # Call Google Speech API
@@ -977,9 +979,12 @@ async def websocket_audio_stream(websocket: WebSocket):
                                 transcript_text = result.alternatives[0].transcript
                                 confidence = result.alternatives[0].confidence
                                 is_final = True
-                                logger.info(f"📝 Google STT Transcript: \"{transcript_text}\"")
+                                
+                        # DEBUG LOG: Immediately before sending to Gemini
+                        print(f"DEBUG - Raw Transcript: '{transcript_text}'")
+                        logger.info(f"📝 Google STT Transcript: \"{transcript_text}\"")
                         
-                        # VALIDATION: Only proceed if we have actual transcript
+                        # STOP EMPTY CALLS: Add check - if not transcript.strip(): return
                         if not transcript_text.strip():
                             logger.debug("⚠️ No transcript from Google STT - skipping Gemini")
                             continue
@@ -1046,9 +1051,13 @@ async def websocket_audio_stream(websocket: WebSocket):
                             }
                         }
                         
-                        # Send result to frontend
-                        await websocket.send_text(json.dumps(response_data))
-                        logger.info(f"📤 Sent transcription with {len(gemini_analysis.keywords)} Gemini explanations")
+                        # Send result to frontend with error handling
+                        try:
+                            await websocket.send_text(json.dumps(response_data))
+                            logger.info(f"📤 Sent transcription with {len(gemini_analysis.keywords)} Gemini explanations")
+                        except Exception as send_error:
+                            logger.error(f"❌ WebSocket send error: {send_error}")
+                            # Prevent disconnect message error from crashing the thread
                     else:
                         # No valid Gemini explanations - do not send to frontend
                         logger.debug(f"⚠️ No Gemini explanations for transcript: \"{transcript_text}\" - not sending to frontend")
