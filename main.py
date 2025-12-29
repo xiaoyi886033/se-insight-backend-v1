@@ -104,13 +104,13 @@ class GeminiAPIService:
             self.is_configured = False
             return
             
-        self.api_url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-pro:generateContent"
+        self.api_url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent"
         
-        # Hardcoded system instruction as specified
-        self.system_instruction = """You are a Senior Software Engineering Professor. Your task is to analyze the provided transcript segments. If you detect any specialized Software Engineering terms (e.g., polymorphism, CI/CD, deadlocks, microservices), provide a concise Chinese explanation (under 50 words) focusing on the current context. Always return the result in a structured JSON format like this: {"original_text": "...", "keywords": [{"term": "term_name", "explanation": "Chinese_explanation"}]}. If no SE terms are found, return an empty keywords list. Do not include any conversational filler."""
+        # Optimized system instruction for gemini-1.5-flash real-time processing
+        self.system_instruction = """You are a Senior Software Engineering Professor analyzing real-time transcripts. Detect specialized SE terms (e.g., polymorphism, CI/CD, microservices, algorithms) and provide concise Chinese explanations (under 40 words). Return JSON format: {"original_text": "...", "keywords": [{"term": "term_name", "explanation": "Chinese_explanation"}]}. Empty keywords list if no SE terms found. No conversational text."""
         
         self.is_configured = True
-        logger.info("✅ Gemini API service configured for SE term explanations")
+        logger.info("✅ Gemini API service configured with gemini-1.5-flash for real-time SE term explanations")
     
     async def analyze_transcript(self, transcript_text: str) -> Optional[GeminiAnalysisResult]:
         """Analyze transcript for SE terms and provide Chinese explanations
@@ -139,7 +139,7 @@ class GeminiAPIService:
                     "temperature": 0.1,  # Low temperature for consistent technical explanations
                     "topK": 1,
                     "topP": 0.8,
-                    "maxOutputTokens": 1024,
+                    "maxOutputTokens": 512,  # Reduced for faster response with gemini-1.5-flash
                     "stopSequences": []
                 },
                 "safetySettings": [
@@ -169,14 +169,19 @@ class GeminiAPIService:
             
             url = f"{self.api_url}?key={self.api_key}"
             
+            logger.info(f"🤖 Making Gemini API request to: {self.api_url}")
+            logger.debug(f"📝 Analyzing transcript: {transcript_text[:100]}...")
+            
             async with aiohttp.ClientSession() as session:
                 async with session.post(url, json=payload, headers=headers, timeout=10) as response:
                     if response.status == 200:
                         result = await response.json()
+                        logger.info("✅ Gemini API request successful")
                         return await self._parse_gemini_response(result, transcript_text)
                     else:
                         error_text = await response.text()
                         logger.error(f"❌ Gemini API error {response.status}: {error_text}")
+                        logger.error(f"🔍 Request URL: {self.api_url}")
                         return None
                         
         except asyncio.TimeoutError:
