@@ -981,11 +981,16 @@ async def websocket_audio_stream(websocket: WebSocket):
                 # Audio Encoding Validation: Double-check int16 conversion
                 import numpy as np
                 try:
-                    float_data = np.frombuffer(chunk_to_process, dtype=np.int16).astype(np.float32) / 32767.0
-                    clipped_data = np.clip(float_data * 32767, -32768, 32767).astype(np.int16)
-                    chunk_to_process = clipped_data.tobytes()
+                    # Task 2: Sanitize Audio Conversion - Clean buffer before processing
+                    float_buffer = np.frombuffer(chunk_to_process, dtype=np.int16).astype(np.float32) / 32767.0
+                    # Step 1: Sanitize the float_buffer using numpy
+                    clean_buffer = np.nan_to_num(float_buffer, nan=0.0, posinf=1.0, neginf=-1.0)
+                    # Step 2: Apply strict clipping and conversion
+                    audio_data_int16 = (np.clip(clean_buffer, -1.0, 1.0) * 32767).astype(np.int16)
+                    chunk_to_process = audio_data_int16.tobytes()
                 except Exception as clip_error:
                     logger.warning(f"Audio clipping validation failed: {clip_error}")
+                    continue  # Skip this chunk if conversion fails
                 
                 # Yield audio chunk to maintain persistent stream
                 yield speech.StreamingRecognizeRequest(audio_content=chunk_to_process)
@@ -1006,7 +1011,8 @@ async def websocket_audio_stream(websocket: WebSocket):
         try:
             # Initialize streaming recognition with persistent generator
             audio_generator = audio_chunk_generator()
-            streaming_responses = google_client.client.streaming_recognize(audio_generator)
+            # Task 1: Fix streaming_recognize Signature - Pass generator as 'requests' parameter
+            streaming_responses = google_client.client.streaming_recognize(requests=audio_generator)
             stream_initialized = True
             logger.info("✅ Persistent bi-directional stream initialized")
             
