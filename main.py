@@ -1022,9 +1022,6 @@ async def websocket_audio_stream(websocket: WebSocket):
                         se_terms=detected_terms,
                         gemini_analysis=gemini_analysis
                     )
-                        timestamp=time.time(),
-                        se_terms=detected_terms,
-                        gemini_analysis=gemini_analysis
                     
                     # TASK 3: WebSocket Data Alignment - Send ONLY if Gemini returns valid explanation
                     if gemini_analysis and gemini_analysis.keywords:
