@@ -956,6 +956,7 @@ async def websocket_audio_stream(websocket: WebSocket):
             single_utterance=False  # Keep stream open for continuous audio
         )
         
+        # Fix 1: Re-write request_generator to yield config first, then audio chunks
         # Handshake Rule: First packet sends StreamingRecognitionConfig
         yield speech.StreamingRecognizeRequest(streaming_config=streaming_config)
         logger.info("✅ Sent StreamingRecognitionConfig (Packet 1)")
@@ -1135,17 +1136,17 @@ async def websocket_audio_stream(websocket: WebSocket):
                     audio_data = message["bytes"]
                     logger.debug(f"📨 Received {len(audio_data)} bytes from {client_id}")
                     
-                    # ASSUME: Incoming WebSocket data from video is Float32
-                    # Formula: audio_data_int16 = (float_buffer * 32767).astype(np.int16)
-                    import numpy as np
+                    # Task 2: Sanitize Audio Data - Add sanitation step before 32767 multiplication
                     try:
                         # Step 1: Interpret incoming bytes as Float32 array
                         float_buffer = np.frombuffer(audio_data, dtype=np.float32)
                         
-                        # Step 2: Apply the mandatory 32767 multiplier transformation
-                        audio_data_int16 = (float_buffer * 32767).astype(np.int16)
+                        # Step 2: Ensure float_buffer has no NaNs or Infs
+                        clean_buffer = np.nan_to_num(float_buffer, nan=0.0)
+                        # Step 3: Clip to -1.0/1.0 and then scale to Int16
+                        audio_data_int16 = (np.clip(clean_buffer, -1.0, 1.0) * 32767).astype(np.int16)
                         
-                        # Step 3: Convert back to bytes for Google STT
+                        # Step 4: Convert back to bytes for Google STT
                         audio_data = audio_data_int16.tobytes()
                         
                         logger.debug(f"🔄 Float32→Int16 transformation: {len(float_buffer)} samples * 32767")
