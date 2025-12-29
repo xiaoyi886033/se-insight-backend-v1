@@ -918,6 +918,12 @@ async def websocket_audio_stream(websocket: WebSocket):
     )
     active_sessions[session_id] = session_data
     
+    # Audio buffering for Gemini API rate limiting
+    audio_buffer = bytearray()
+    buffer_size_threshold = 32000  # ~2 seconds of 16kHz mono audio
+    last_gemini_call = 0
+    gemini_interval = 2.0  # Minimum 2 seconds between Gemini calls
+    
     logger.info(f"🔌 WebSocket client connected: {client_id} (Session: {session_id})")
     
     try:
@@ -931,6 +937,16 @@ async def websocket_audio_stream(websocket: WebSocket):
                     audio_data = message["bytes"]
                     logger.debug(f"📨 Received {len(audio_data)} bytes from {client_id}")
                     
+                    # Add to buffer for Gemini processing
+                    audio_buffer.extend(audio_data)
+                    
+                    # Only process Gemini analysis when buffer is full AND interval has passed
+                    current_time = time.time()
+                    should_process_gemini = (
+                        len(audio_buffer) >= buffer_size_threshold and 
+                        (current_time - last_gemini_call) >= gemini_interval
+                    )
+                    
                     # TODO: Implement Google Speech API streaming recognition
                     # For now, simulate transcription with SE term detection
                     mock_text = "This is a demonstration of API design patterns and microservices architecture using Docker containers"
@@ -939,13 +955,18 @@ async def websocket_audio_stream(websocket: WebSocket):
                     # Detect SE terminology in transcription
                     detected_terms = se_knowledge_base.detect_se_terms(mock_text)
                     
-                    # Get Gemini analysis for final transcripts (PO3)
+                    # Get Gemini analysis ONLY when buffer conditions are met
                     gemini_analysis = None
-                    if is_final and mock_text.strip():
+                    if should_process_gemini and is_final and mock_text.strip():
                         try:
                             gemini_analysis = await gemini_service.analyze_transcript(mock_text)
                             if gemini_analysis:
                                 logger.info(f"🤖 Gemini analysis: {len(gemini_analysis.keywords)} Chinese explanations")
+                            
+                            # Reset buffer and timer after successful Gemini call
+                            audio_buffer.clear()
+                            last_gemini_call = current_time
+                            
                         except Exception as e:
                             logger.error(f"❌ Gemini analysis failed: {e}")
                     
