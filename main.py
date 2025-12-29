@@ -28,8 +28,8 @@ from fastapi.responses import JSONResponse
 # Google Cloud Speech imports - Task 3: Use speech_v1.SpeechAsyncClient
 # Fix 1: Import and use google.api_core.retry_async.AsyncRetry instead of sync version
 try:
-    from google.cloud import speech_v1
-    from google.api_core.retry_async import AsyncRetry
+    from google.cloud import speech_v1 as speech
+    from google.api_core import retry_async as retries
     GOOGLE_CLOUD_AVAILABLE = True
     print("✅ Google Cloud Speech API v1 available with AsyncRetry")
 except ImportError:
@@ -741,7 +741,7 @@ class GoogleSpeechClient:
                 os.environ['GOOGLE_APPLICATION_CREDENTIALS'] = temp_file.name
                 
                 # Task 3: Initialize SpeechAsyncClient for async generator support
-                self.client = speech_v1.SpeechAsyncClient()
+                self.client = speech.SpeechAsyncClient()
                 logger.info("✅ Google Speech v1 AsyncClient initialized with GCP_KEY_JSON")
                 
                 # Clean up temporary file
@@ -756,16 +756,16 @@ class GoogleSpeechClient:
         """Get Google Speech recognition configuration optimized for SE terminology
         
         Returns:
-            speech_v1.RecognitionConfig: Configured for 16kHz audio with SE context
+            speech.RecognitionConfig: Configured for 16kHz audio with SE context
         """
-        return speech_v1.RecognitionConfig(
-            encoding=speech_v1.RecognitionConfig.AudioEncoding.LINEAR16,
+        return speech.RecognitionConfig(
+            encoding=speech.RecognitionConfig.AudioEncoding.LINEAR16,
             sample_rate_hertz=self.audio_config.sample_rate,
             language_code="en-US",
             enable_automatic_punctuation=True,
             enable_word_confidence=True,
             speech_contexts=[
-                speech_v1.SpeechContext(
+                speech.SpeechContext(
                     phrases=[
                         # Core SE terminology for better recognition
                         "software engineering", "API", "microservices", "database",
@@ -902,24 +902,37 @@ async def get_se_term_definition(term: str):
     }
 
 # Task 3: Async Streaming Implementation (The Core Bug)
-async def request_generator(audio_queue, config):
-    """Task 3: Define a generator that yields the Config first, then the Audio.
+async def request_generator(audio_queue, streaming_config):
+    """Dimension 3: First packet MUST be config yield
     
-    Fix 3: Validate the request_generator - Make sure you use async for or asyncio.Queue inside the generator to yield chunks.
-    Verification: Log DEBUG - Yielding audio chunk to gRPC before each yield.
+    Implementation: Replace the existing audio_generator or stream request loop with proper buffering
     """
-    # FIRST PACKET: Config
-    yield speech_v1.StreamingRecognizeRequest(streaming_config=config)
+    # Dimension 3: First packet MUST be config yield
+    yield speech.StreamingRecognizeRequest(streaming_config=streaming_config)
     print("DEBUG - Yielded config to gRPC")
     
-    # SUBSEQUENT PACKETS: Audio
-    while True:
+    # Buffer for Temporal Aggregation (100ms)
+    accumulated_buffer = bytearray()
+    
+    while True:  # Receiving small 42-byte packets from WebSocket
         try:
             chunk = await audio_queue.get()
-            if chunk is None:  # Shutdown signal
+            if chunk is None:  # break
                 break
-            print(f"DEBUG - Yielding audio chunk to gRPC: {len(chunk)} bytes")
-            yield speech_v1.StreamingRecognizeRequest(audio_content=chunk)
+            
+            # Dimension 2: Math Conversion & Sanitization
+            float_array = np.frombuffer(chunk, dtype=np.float32)
+            clean_float = np.nan_to_num(float_array, nan=0.0)
+            int16_array = (np.clip(clean_float, -1.0, 1.0) * 32767).astype(np.int16)
+            
+            accumulated_buffer.extend(int16_array.tobytes())
+            
+            # Dimension 3: Only yield when buffer >= 100ms (3200 bytes)
+            if len(accumulated_buffer) >= 3200:
+                print(f"DEBUG - Sending 100ms Chunk (3200 bytes) to gRPC")
+                yield speech.StreamingRecognizeRequest(audio_content=bytes(accumulated_buffer))
+                accumulated_buffer.clear()
+                
         except Exception as e:
             logger.error(f"❌ Generator error: {e}")
             break
@@ -966,8 +979,8 @@ async def websocket_audio_stream(websocket: WebSocket):
     )
     
     # Task 4: Explicit LINEAR16 Parameters - Lock sample_rate_hertz to 16000 and encoding to LINEAR16
-    recognition_config = speech_v1.RecognitionConfig(
-        encoding=speech_v1.RecognitionConfig.AudioEncoding.LINEAR16,  # Explicit LINEAR16
+    recognition_config = speech.RecognitionConfig(
+        encoding=speech.RecognitionConfig.AudioEncoding.LINEAR16,  # Explicit LINEAR16
         sample_rate_hertz=16000,  # Lock to 16000
         language_code="en-US",
         model="latest_long",
@@ -976,7 +989,7 @@ async def websocket_audio_stream(websocket: WebSocket):
     )
     
     # Task 4: Session Persistence - Ensure interim_results=True is active so we see partial text immediately
-    config = speech_v1.StreamingRecognitionConfig(
+    config = speech.StreamingRecognitionConfig(
         config=recognition_config,
         interim_results=True,  # Ensure interim_results=True is active so we see partial text immediately
         single_utterance=False  # Keep stream open for continuous audio
@@ -1028,32 +1041,11 @@ async def websocket_audio_stream(websocket: WebSocket):
                         continue
                 
                 if "bytes" in message:
-                    # Process audio data - Task 2: Precision Audio Conversion
+                    # Process audio data - Send directly to queue for proper buffering
                     audio_data = message["bytes"]
                     logger.debug(f"📨 Received {len(audio_data)} bytes from {client_id}")
                     
-                    # Task 2: Replace the overflow-prone line with:
-                    try:
-                        # Step 1: Interpret incoming bytes as Float32 array
-                        float_buffer = np.frombuffer(audio_data, dtype=np.float32)
-                        
-                        # Task 2: Clean NaNs and clamp values to prevent overflow warnings
-                        clean_float = np.nan_to_num(float_buffer, nan=0.0)
-                        audio_data_int16 = (np.clip(clean_float, -1.0, 1.0) * 32767).astype(np.int16)
-                        
-                        # Step 3: Convert back to bytes for Google STT
-                        audio_data = audio_data_int16.tobytes()
-                        
-                        logger.debug(f"🔄 Float32→Int16 transformation: {len(float_buffer)} samples * 32767")
-                        
-                    except Exception as transform_error:
-                        logger.error(f"❌ Critical Float32→Int16 transformation failed: {transform_error}")
-                        continue  # Skip this chunk if transformation fails
-                    
-                    # Add to audio buffer for Gemini processing
-                    audio_buffer.extend(audio_data)
-                    
-                    # Task 3: Send audio chunk to async generator queue
+                    # Send raw audio data to queue for buffering and processing
                     try:
                         audio_queue.put_nowait(audio_data)
                     except asyncio.QueueFull:
@@ -1120,7 +1112,7 @@ async def process_streaming_responses(websocket: WebSocket, session_data: Sessio
         # Fix 2: Refactor the call to use AsyncRetry - stream = await client.streaming_recognize(requests=request_generator(), retry=AsyncRetry())
         stream = await google_client.client.streaming_recognize(
             requests=request_generator(audio_queue, config), 
-            retry=AsyncRetry()
+            retry=retries.AsyncRetry()
         )
         
         logger.info("✅ Async streaming recognition started with AsyncRetry")
