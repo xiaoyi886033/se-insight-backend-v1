@@ -926,6 +926,9 @@ async def websocket_audio_stream(websocket: WebSocket):
     last_gemini_call = 0
     gemini_interval = 2.0  # Minimum 2 seconds between Gemini calls
     
+    # Dynamic audio configuration from client
+    client_sample_rate = 16000  # Default, will be updated from start_session
+    
     logger.info(f"🔌 WebSocket client connected: {client_id} (Session: {session_id})")
     
     try:
@@ -934,6 +937,30 @@ async def websocket_audio_stream(websocket: WebSocket):
             message = await websocket.receive()
             
             if message["type"] == "websocket.receive":
+                # Handle JSON messages (start_session, etc.)
+                if "text" in message:
+                    try:
+                        json_message = json.loads(message["text"])
+                        if json_message.get("type") == "start_session":
+                            # Extract client audio configuration
+                            config = json_message.get("config", {})
+                            client_sample_rate = config.get("sampleRate", 16000)
+                            logger.info(f"🎵 Client audio config - Sample Rate: {client_sample_rate}Hz")
+                            
+                            # Send acknowledgment
+                            await websocket.send_text(json.dumps({
+                                "type": "session_started",
+                                "session_id": session_id,
+                                "server_config": {
+                                    "sample_rate": client_sample_rate,
+                                    "encoding": "LINEAR16"
+                                }
+                            }))
+                            continue
+                    except json.JSONDecodeError:
+                        logger.warning(f"⚠️ Invalid JSON from {client_id}")
+                        continue
+                
                 if "bytes" in message:
                     # Process audio data (16kHz, Mono, Int16 from extension)
                     audio_data = message["bytes"]
@@ -941,6 +968,18 @@ async def websocket_audio_stream(websocket: WebSocket):
                     
                     # Add to buffer for Gemini processing
                     audio_buffer.extend(audio_data)
+                    
+                    # DEBUG: Add Audio Volume Log - log average amplitude of 2-second buffer
+                    if len(audio_buffer) >= buffer_size_threshold:
+                        # Calculate max amplitude from Int16 data (assuming LINEAR16 format)
+                        import struct
+                        try:
+                            # Convert bytes to Int16 values for amplitude calculation
+                            int16_samples = struct.unpack(f'<{len(audio_buffer)//2}h', audio_buffer)
+                            max_amplitude = max(abs(sample) for sample in int16_samples) if int16_samples else 0
+                            print(f"DEBUG - Audio Buffer size: {len(audio_buffer)}, Max Amplitude: {max_amplitude}")
+                        except struct.error:
+                            print(f"DEBUG - Audio Buffer size: {len(audio_buffer)}, Max Amplitude: [conversion error]")
                     
                     # Only process Gemini analysis when buffer is full AND interval has passed
                     current_time = time.time()
@@ -955,14 +994,14 @@ async def websocket_audio_stream(websocket: WebSocket):
                         continue
                     
                     try:
-                        # Configure audio for Google Speech API (LINEAR16, 16000Hz)
+                        # Configure audio for Google Speech API with DYNAMIC sample rate
                         audio = speech.RecognitionAudio(content=bytes(audio_data))
                         config = speech.RecognitionConfig(
                             encoding=speech.RecognitionConfig.AudioEncoding.LINEAR16,
-                            sample_rate_hertz=16000,
+                            sample_rate_hertz=client_sample_rate,  # Must match client's sampleRate
                             language_code="en-US",
                             enable_automatic_punctuation=True,  # Explicit config
-                            model="latest_long"  # Force recognition model
+                            model="latest_long"  # Force recognition model for YouTube streams
                         )
                         
                         # Call Google Speech API
