@@ -104,9 +104,9 @@ class GeminiAPIService:
             self.is_configured = False
             return
             
-        self.api_url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent"
+        self.api_url = "https://generativelanguage.googleapis.com/v1/models/gemini-3-flash:generateContent"
         
-        # Optimized system instruction for gemini-1.5-flash real-time processing
+        # Optimized system instruction for gemini-3-flash real-time processing
         self.system_instruction = """You are a Senior Software Engineering Professor analyzing real-time transcripts. Detect specialized SE terms (e.g., polymorphism, CI/CD, microservices, algorithms) and provide concise Chinese explanations (under 40 words). Return JSON format: {"original_text": "...", "keywords": [{"term": "term_name", "explanation": "Chinese_explanation"}]}. Empty keywords list if no SE terms found. No conversational text."""
         
         # Buffer mechanism to prevent too-frequent API calls
@@ -115,7 +115,7 @@ class GeminiAPIService:
         self.pending_transcripts = []
         
         self.is_configured = True
-        logger.info("✅ Gemini API service configured with gemini-1.5-flash for real-time SE term explanations")
+        logger.info("✅ Gemini API service configured with gemini-3-flash for real-time SE term explanations")
     
     async def analyze_transcript(self, transcript_text: str) -> Optional[GeminiAnalysisResult]:
         """Analyze transcript for SE terms and provide Chinese explanations
@@ -158,7 +158,7 @@ class GeminiAPIService:
                     "temperature": 0.1,  # Low temperature for consistent technical explanations
                     "topK": 1,
                     "topP": 0.8,
-                    "maxOutputTokens": 512,  # Reduced for faster response with gemini-1.5-flash
+                    "maxOutputTokens": 512,  # Reduced for faster response with gemini-3-flash
                     "stopSequences": []
                 },
                 "safetySettings": [
