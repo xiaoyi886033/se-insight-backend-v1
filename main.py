@@ -933,14 +933,159 @@ async def websocket_audio_stream(websocket: WebSocket):
     # Dynamic audio configuration from client
     client_sample_rate = 16000  # Default, will be updated from start_session
     
-    # Create async task for processing audio chunks without blocking the event loop
-    async def process_audio_chunks():
-        """Process aggregated audio chunks asynchronously without blocking the WebSocket event loop"""
-        nonlocal last_gemini_call, audio_buffer
+    # Streaming Recognition Setup - Persistent Stream with Session Context
+    streaming_generator = None
+    streaming_responses = None
+    stream_initialized = False
+    
+    def create_streaming_generator():
+        """Create persistent streaming request generator"""
+        # First Message: Send StreamingRecognitionConfig ONCE per WebSocket connection
+        recognition_config = speech.RecognitionConfig(
+            encoding=speech.RecognitionConfig.AudioEncoding.LINEAR16,
+            sample_rate_hertz=16000,
+            language_code="en-US",
+            model="latest_long",
+            enable_automatic_punctuation=True,
+            enable_word_confidence=True
+        )
         
+        streaming_config = speech.StreamingRecognitionConfig(
+            config=recognition_config,
+            interim_results=True,  # Enable interim results for real-time feedback
+            single_utterance=False  # Keep stream open for continuous audio
+        )
+        
+        # Yield the config first
+        yield speech.StreamingRecognizeRequest(streaming_config=streaming_config)
+        
+        # Then yield audio chunks from the queue
         while True:
             try:
-                # Wait for aggregated chunk from queue (non-blocking)
+                # Get audio chunk from queue (blocking within generator)
+                chunk_data = stt_chunk_queue.get_nowait()
+                if chunk_data is None:  # Shutdown signal
+                    break
+                    
+                chunk_to_process, current_time = chunk_data
+                
+                # Audio Encoding Validation: Double-check int16 conversion
+                import numpy as np
+                try:
+                    float_data = np.frombuffer(chunk_to_process, dtype=np.int16).astype(np.float32) / 32767.0
+                    clipped_data = np.clip(float_data * 32767, -32768, 32767).astype(np.int16)
+                    chunk_to_process = clipped_data.tobytes()
+                except Exception as clip_error:
+                    logger.warning(f"Audio clipping validation failed: {clip_error}")
+                
+                # Subsequent Messages: Stream ONLY raw audio bytes
+                yield speech.StreamingRecognizeRequest(audio_content=chunk_to_process)
+                
+            except asyncio.QueueEmpty:
+                # No audio available, continue waiting
+                continue
+            except Exception as gen_error:
+                logger.error(f"❌ Streaming generator error: {gen_error}")
+                break
+    
+    # Create async task for processing streaming responses
+    async def process_streaming_responses():
+        """Process streaming recognition responses asynchronously"""
+        nonlocal streaming_responses, last_gemini_call, audio_buffer, stream_initialized
+        
+        if not google_client.client:
+            logger.error("❌ Google Speech client not initialized")
+            return
+        
+        try:
+            # Initialize streaming recognition with persistent generator
+            streaming_generator = create_streaming_generator()
+            streaming_responses = google_client.client.streaming_recognize(streaming_generator)
+            stream_initialized = True
+            logger.info("✅ Streaming recognition initialized with persistent session")
+            
+            # Process streaming responses
+            for response in streaming_responses:
+                try:
+                    # Process each streaming response
+                    for result in response.results:
+                        if result.alternatives:
+                            transcript_text = result.alternatives[0].transcript
+                            is_final = result.is_final
+                            confidence = result.alternatives[0].confidence if result.alternatives[0].confidence else 0.0
+                            current_time = time.time()
+                            
+                            # Output Logic: Log transcript immediately (even if not final)
+                            print(f"DEBUG - Raw Transcript: '{transcript_text}' (final: {is_final})")
+                            logger.info(f"📝 Google STT: \"{transcript_text}\" (final: {is_final})")
+                            
+                            if transcript_text.strip():
+                                # Process SE terms and Gemini analysis
+                                detected_terms = se_knowledge_base.detect_se_terms(transcript_text)
+                                
+                                # Check if should process Gemini (only for final results)
+                                should_process_gemini_now = (
+                                    is_final and
+                                    len(audio_buffer) >= buffer_size_threshold and 
+                                    (current_time - last_gemini_call) >= gemini_interval
+                                )
+                                
+                                gemini_analysis = None
+                                if should_process_gemini_now and transcript_text.strip():
+                                    try:
+                                        gemini_analysis = await gemini_service.analyze_transcript(transcript_text)
+                                        if gemini_analysis:
+                                            logger.info(f"🤖 Gemini analysis: {len(gemini_analysis.keywords)} explanations")
+                                        audio_buffer.clear()
+                                        last_gemini_call = current_time
+                                    except Exception as e:
+                                        logger.error(f"❌ Gemini analysis failed: {e}")
+                                
+                                # Send results if we have Gemini analysis
+                                if gemini_analysis and gemini_analysis.keywords:
+                                    response_data = {
+                                        "type": "transcription_result",
+                                        "text": transcript_text,
+                                        "is_final": is_final,
+                                        "confidence": confidence,
+                                        "timestamp": current_time,
+                                        "se_terms": detected_terms,
+                                        "se_definitions": {},
+                                        "gemini_analysis": {
+                                            "original_text": gemini_analysis.original_text,
+                                            "keywords": [
+                                                {"term": kw.term, "explanation": kw.explanation}
+                                                for kw in gemini_analysis.keywords
+                                            ]
+                                        }
+                                    }
+                                    
+                                    try:
+                                        await websocket.send_text(json.dumps(response_data))
+                                        logger.info(f"📤 Sent transcription with {len(gemini_analysis.keywords)} explanations")
+                                    except Exception as send_error:
+                                        logger.error(f"❌ WebSocket send error: {send_error}")
+                                
+                                # Update session data
+                                if is_final:
+                                    session_data.transcripts.append(transcript_text)
+                                    session_data.se_terms_detected.extend(detected_terms)
+                                    session_data.se_terms_detected = list(set(session_data.se_terms_detected))
+                        
+                except Exception as response_error:
+                    logger.error(f"❌ Streaming response processing error: {response_error}")
+                    continue
+                    
+        except Exception as streaming_error:
+            logger.error(f"❌ Streaming recognition error: {streaming_error}")
+            stream_initialized = False
+    
+    # Create async task for feeding audio chunks to the streaming queue
+    async def process_audio_chunks():
+        """Process aggregated audio chunks and feed to streaming recognition"""
+        while True:
+            try:
+                # Wait for aggregated chunk from main queue (non-blocking)
                 chunk_data = await stt_chunk_queue.get()
                 if chunk_data is None:  # Shutdown signal
                     break
@@ -951,104 +1096,23 @@ async def websocket_audio_stream(websocket: WebSocket):
                 sample_count = len(chunk_to_process) // 2
                 
                 # Logging: Keep the DEBUG log for verification
-                try:
-                    import numpy as np
-                    chunk_array = np.frombuffer(chunk_to_process, dtype=np.int16)
-                    max_amp = np.max(np.abs(chunk_array)) if len(chunk_array) > 0 else 0
-                    print(f"DEBUG - Sending Chunk: {sample_count} samples")
-                except Exception:
-                    print(f"DEBUG - Sending Chunk: {sample_count} samples")
+                print(f"DEBUG - Sending Chunk: {sample_count} samples")
                 
                 if sample_count < 1600:
                     logger.warning(f"⚠️ Chunk too small: {sample_count} samples < 1600 minimum")
                     continue
                 
-                # Process with Google STT (non-blocking)
-                if google_client.client:
-                    try:
-                        audio = speech.RecognitionAudio(content=bytes(chunk_to_process))
-                        config = speech.RecognitionConfig(
-                            encoding=speech.RecognitionConfig.AudioEncoding.LINEAR16,
-                            sample_rate_hertz=16000,
-                            language_code="en-US",
-                            model="latest_long"
-                        )
-                        
-                        # Non-blocking call to Google STT
-                        response = google_client.client.recognize(config=config, audio=audio)
-                        
-                        # Process response
-                        transcript_text = ""
-                        is_final = False
-                        confidence = 0.0
-                        
-                        if response.results:
-                            result = response.results[0]
-                            if result.alternatives:
-                                transcript_text = result.alternatives[0].transcript
-                                confidence = result.alternatives[0].confidence
-                                is_final = True
-                        
-                        print(f"DEBUG - Raw Transcript: '{transcript_text}'")
-                        
-                        if transcript_text.strip():
-                            # Process Gemini and send results
-                            detected_terms = se_knowledge_base.detect_se_terms(transcript_text)
-                            
-                            # Check if should process Gemini
-                            should_process_gemini_now = (
-                                len(audio_buffer) >= buffer_size_threshold and 
-                                (current_time - last_gemini_call) >= gemini_interval
-                            )
-                            
-                            gemini_analysis = None
-                            if should_process_gemini_now and is_final and transcript_text.strip():
-                                try:
-                                    gemini_analysis = await gemini_service.analyze_transcript(transcript_text)
-                                    if gemini_analysis:
-                                        logger.info(f"🤖 Gemini analysis: {len(gemini_analysis.keywords)} explanations")
-                                    audio_buffer.clear()
-                                    last_gemini_call = current_time
-                                except Exception as e:
-                                    logger.error(f"❌ Gemini analysis failed: {e}")
-                            
-                            # Send results if we have Gemini analysis
-                            if gemini_analysis and gemini_analysis.keywords:
-                                response_data = {
-                                    "type": "transcription_result",
-                                    "text": transcript_text,
-                                    "is_final": is_final,
-                                    "confidence": confidence,
-                                    "timestamp": current_time,
-                                    "se_terms": detected_terms,
-                                    "se_definitions": {},
-                                    "gemini_analysis": {
-                                        "original_text": gemini_analysis.original_text,
-                                        "keywords": [
-                                            {"term": kw.term, "explanation": kw.explanation}
-                                            for kw in gemini_analysis.keywords
-                                        ]
-                                    }
-                                }
-                                
-                                try:
-                                    await websocket.send_text(json.dumps(response_data))
-                                    logger.info(f"📤 Sent transcription with {len(gemini_analysis.keywords)} explanations")
-                                except Exception as send_error:
-                                    logger.error(f"❌ WebSocket send error: {send_error}")
-                        
-                    except Exception as stt_error:
-                        logger.error(f"❌ Google STT error: {stt_error}")
-                
+                # The chunk will be processed by the streaming generator
                 # Mark task as done
                 stt_chunk_queue.task_done()
                 
             except Exception as e:
-                logger.error(f"❌ Audio processing task error: {e}")
+                logger.error(f"❌ Audio chunk processing error: {e}")
                 await asyncio.sleep(0.1)  # Brief pause before continuing
     
-    # Start the audio processing task
+    # Start the audio processing tasks
     audio_task = asyncio.create_task(process_audio_chunks())
+    streaming_task = asyncio.create_task(process_streaming_responses())
     
     logger.info(f"🔌 WebSocket client connected: {client_id} (Session: {session_id})")
     
@@ -1134,10 +1198,11 @@ async def websocket_audio_stream(websocket: WebSocket):
     except WebSocketDisconnect:
         logger.info(f"🔌 WebSocket client disconnected: {client_id}")
         
-        # Stop audio processing task
+        # Stop audio processing tasks
         try:
             stt_chunk_queue.put_nowait(None)  # Shutdown signal
             audio_task.cancel()
+            streaming_task.cancel()
         except:
             pass
         
@@ -1156,10 +1221,11 @@ async def websocket_audio_stream(websocket: WebSocket):
     except Exception as e:
         logger.error(f"❌ WebSocket error for {client_id}: {e}")
         
-        # Stop audio processing task
+        # Stop audio processing tasks
         try:
             stt_chunk_queue.put_nowait(None)  # Shutdown signal
             audio_task.cancel()
+            streaming_task.cancel()
         except:
             pass
         
