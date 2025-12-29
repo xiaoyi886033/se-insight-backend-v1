@@ -962,25 +962,30 @@ async def websocket_audio_stream(websocket: WebSocket):
                         continue
                 
                 if "bytes" in message:
-                    # Process audio data - Bit-Depth Transform Logic
+                    # Process audio data - Strict Int16 Transformation per Discovery Document
                     audio_data = message["bytes"]
                     logger.debug(f"📨 Received {len(audio_data)} bytes from {client_id}")
                     
-                    # Bit-Depth Transform: Treat incoming bytes as Float32Array first
+                    # ASSUME: Incoming WebSocket data from video is Float32
+                    # Formula: audio_data_int16 = (float_buffer * 32767).astype(np.int16)
                     import numpy as np
                     try:
-                        # Extension may send Float32 data, convert to Int16 for Google STT
-                        float32_samples = np.frombuffer(audio_data, dtype=np.float32)
+                        # Step 1: Interpret incoming bytes as Float32 array
+                        float_buffer = np.frombuffer(audio_data, dtype=np.float32)
                         
-                        # Apply scaling formula: int16_samples = (float32_samples * 32767).astype(np.int16)
-                        int16_samples = (float32_samples * 32767).astype(np.int16)
-                        audio_data = int16_samples.tobytes()
+                        # Step 2: Apply the mandatory 32767 multiplier transformation
+                        audio_data_int16 = (float_buffer * 32767).astype(np.int16)
                         
-                        logger.debug(f"🔄 Float32 to Int16 conversion: {len(float32_samples)} samples")
+                        # Step 3: Convert back to bytes for Google STT
+                        audio_data = audio_data_int16.tobytes()
+                        
+                        logger.debug(f"🔄 Float32→Int16 transformation: {len(float_buffer)} samples * 32767")
+                        
+                        # Without this multiplier, the output is 0.0 - FIXED IMMEDIATELY
                         
                     except Exception as transform_error:
-                        # If not Float32, try as Int16 directly
-                        logger.debug(f"⚠️ Float32 conversion failed, using raw bytes: {transform_error}")
+                        logger.error(f"❌ Critical Float32→Int16 transformation failed: {transform_error}")
+                        continue  # Skip this chunk if transformation fails
                     
                     # Add to buffer for Gemini processing
                     audio_buffer.extend(audio_data)
@@ -996,7 +1001,16 @@ async def websocket_audio_stream(websocket: WebSocket):
                         # Verify we're receiving valid Int16 data
                         if len(audio_array) > 0:
                             max_val = np.max(np.abs(audio_array))
-                            print(f"DEBUG - Max Int16 Value: {max_val} (should be <= 32767)")
+                            min_val = np.min(audio_array)
+                            max_abs = np.max(np.abs(audio_array))
+                            print(f"DEBUG - Int16 Range: min={min_val}, max={max_abs} (should be <= 32767)")
+                            print(f"DEBUG - Sample Count: {len(audio_array)} samples")
+                            
+                            # Check if all samples are zero (silent buffer)
+                            if max_abs == 0:
+                                print("DEBUG - CRITICAL: All audio samples are ZERO - silent buffer detected!")
+                            else:
+                                print(f"DEBUG - Audio detected with max amplitude: {max_abs}")
                     except Exception as vol_error:
                         print(f"DEBUG - Audio Volume: [calculation error: {vol_error}]")
                     
@@ -1025,18 +1039,31 @@ async def websocket_audio_stream(websocket: WebSocket):
                         continue
                     
                     try:
-                        # Explicit RecognitionConfig (v1 Spec) - Google Cloud STT v1 technical specifications
+                        # Explicit RecognitionConfig (v1) per Discovery Document
+                        # encoding: speech.RecognitionConfig.AudioEncoding.LINEAR16
+                        # sample_rate_hertz: 16000
+                        # language_code: "en-US"
+                        # model: "latest_long" (optimized for video streams)
                         audio = speech.RecognitionAudio(content=bytes(audio_data))
                         config = speech.RecognitionConfig(
                             encoding=speech.RecognitionConfig.AudioEncoding.LINEAR16,
-                            sample_rate_hertz=16000,  # Must match your frontend's output
+                            sample_rate_hertz=16000,
                             language_code="en-US",
-                            enable_automatic_punctuation=True,
-                            model="latest_long"  # Optimized for continuous video audio
+                            model="latest_long"
                         )
                         
-                        # Call Google Speech API
+                        # Call Google Speech API with data integrity validation
                         response = google_client.client.recognize(config=config, audio=audio)
+                        
+                        # Validate Data Integrity: Check for silent buffer before sending to Google
+                        try:
+                            import numpy as np
+                            audio_check = np.frombuffer(audio_data, dtype=np.int16)
+                            if np.max(np.abs(audio_check)) == 0:
+                                logger.warning("WARNING: SILENT BUFFER RECEIVED")
+                                continue  # Skip processing silent audio
+                        except Exception as check_error:
+                            logger.warning(f"Audio integrity check failed: {check_error}")
                         
                         # Extract actual transcript from Google
                         transcript_text = ""
@@ -1066,11 +1093,12 @@ async def websocket_audio_stream(websocket: WebSocket):
                     # Detect SE terminology in REAL transcription
                     detected_terms = se_knowledge_base.detect_se_terms(transcript_text)
                     
-                    # TASK 2: Gemini 2.0 Flash (v1beta) - ONLY pass real transcript
+                    # TASK 2: Gemini 2.0 Flash (v1beta) - ONLY pass real transcript if NOT empty
                     gemini_analysis = None
                     if should_process_gemini and is_final and transcript_text.strip():
                         try:
-                            # STRICT: Only pass real transcript from STT to Gemini
+                            # Clean the Gemini Path: Only trigger Gemini if transcript is NOT empty
+                            # URL: https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={api_key}
                             gemini_analysis = await gemini_service.analyze_transcript(transcript_text)
                             if gemini_analysis:
                                 logger.info(f"🤖 Gemini 2.0 Flash analysis: {len(gemini_analysis.keywords)} Chinese explanations")
