@@ -940,29 +940,10 @@ async def websocket_audio_stream(websocket: WebSocket):
     
     # Generator Pattern: Use async generator to yield audio chunks into the stream
     async def audio_chunk_generator():
-        """Async generator that yields audio chunks to maintain persistent bi-directional stream"""
-        # Packet 1: StreamingRecognitionConfig (send only once)
-        recognition_config = speech.RecognitionConfig(
-            encoding=speech.RecognitionConfig.AudioEncoding.LINEAR16,
-            sample_rate_hertz=16000,
-            language_code="en-US",
-            model="latest_long",
-            enable_automatic_punctuation=True,
-            enable_word_confidence=True
-        )
+        """Async generator that yields ONLY audio chunks - config is passed separately"""
+        # Task 4: Session Persistence - Do NOT send config in generator, it's passed separately
+        # The generator yields ONLY audio chunks to maintain session persistence
         
-        streaming_config = speech.StreamingRecognitionConfig(
-            config=recognition_config,
-            interim_results=True,  # This is the ONLY way to get real-time subtitles before a sentence is finished
-            single_utterance=False  # Keep stream open for continuous audio
-        )
-        
-        # Fix 1: Re-write request_generator to yield config first, then audio chunks
-        # Handshake Rule: First packet sends StreamingRecognitionConfig
-        yield speech.StreamingRecognizeRequest(streaming_config=streaming_config)
-        logger.info("✅ Sent StreamingRecognitionConfig (Packet 1)")
-        
-        # Packet 2-N: StreamingRecognizeRequest(audio_content=chunk)
         while True:
             try:
                 # Wait for aggregated chunk from queue
@@ -981,7 +962,6 @@ async def websocket_audio_stream(websocket: WebSocket):
                     continue
                 
                 # Audio Encoding Validation: Double-check int16 conversion
-                import numpy as np
                 try:
                     # Task 2: Sanitize Audio Conversion - Clean buffer before processing
                     float_buffer = np.frombuffer(chunk_to_process, dtype=np.int16).astype(np.float32) / 32767.0
@@ -994,7 +974,7 @@ async def websocket_audio_stream(websocket: WebSocket):
                     logger.warning(f"Audio clipping validation failed: {clip_error}")
                     continue  # Skip this chunk if conversion fails
                 
-                # Yield audio chunk to maintain persistent stream
+                # Yield ONLY audio chunk - no config needed since it's passed separately
                 yield speech.StreamingRecognizeRequest(audio_content=chunk_to_process)
                 
             except Exception as gen_error:
@@ -1011,10 +991,28 @@ async def websocket_audio_stream(websocket: WebSocket):
             return
         
         try:
-            # Fix 3: Correct STT Streaming Signature - Re-write the call as follows
+            # Task 3: Correct STT Streaming Signature - MUST receive both config and request generator
+            recognition_config = speech.RecognitionConfig(
+                encoding=speech.RecognitionConfig.AudioEncoding.LINEAR16,
+                sample_rate_hertz=16000,
+                language_code="en-US",
+                model="latest_long",
+                enable_automatic_punctuation=True,
+                enable_word_confidence=True
+            )
+            
+            streaming_config = speech.StreamingRecognitionConfig(
+                config=recognition_config,
+                interim_results=True,  # This is the ONLY way to get real-time subtitles before a sentence is finished
+                single_utterance=False  # Keep stream open for continuous audio
+            )
+            
+            # Refactor to: responses = await client.streaming_recognize(config=streaming_config, requests=audio_generator())
             audio_generator = audio_chunk_generator()
-            # Action: responses = await client.streaming_recognize(requests=request_generator())
-            streaming_responses = google_client.client.streaming_recognize(requests=audio_generator)
+            streaming_responses = google_client.client.streaming_recognize(
+                config=streaming_config,
+                requests=audio_generator
+            )
             stream_initialized = True
             logger.info("✅ Persistent bi-directional stream initialized")
             
