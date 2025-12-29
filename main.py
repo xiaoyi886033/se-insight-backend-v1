@@ -13,6 +13,7 @@ import base64
 import tempfile
 import smtplib
 import aiohttp
+import numpy as np  # Fix 1: Ensure import numpy as np is at the very top of the file
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from datetime import datetime
@@ -1010,9 +1011,9 @@ async def websocket_audio_stream(websocket: WebSocket):
             return
         
         try:
-            # Initialize streaming recognition with persistent generator
+            # Fix 3: Correct STT Streaming Signature - Re-write the call as follows
             audio_generator = audio_chunk_generator()
-            # Task 1: Fix streaming_recognize Signature - Pass generator as 'requests' parameter
+            # Action: responses = await client.streaming_recognize(requests=request_generator())
             streaming_responses = google_client.client.streaming_recognize(requests=audio_generator)
             stream_initialized = True
             logger.info("✅ Persistent bi-directional stream initialized")
@@ -1136,17 +1137,16 @@ async def websocket_audio_stream(websocket: WebSocket):
                     audio_data = message["bytes"]
                     logger.debug(f"📨 Received {len(audio_data)} bytes from {client_id}")
                     
-                    # Task 2: Sanitize Audio Data - Add sanitation step before 32767 multiplication
+                    # Task 2: Sanitize Audio Data - Replace conversion with safe implementation
                     try:
                         # Step 1: Interpret incoming bytes as Float32 array
                         float_buffer = np.frombuffer(audio_data, dtype=np.float32)
                         
-                        # Step 2: Ensure float_buffer has no NaNs or Infs
+                        # Fix 2: Correct 32767 conversion with clamping and NaN protection
                         clean_buffer = np.nan_to_num(float_buffer, nan=0.0)
-                        # Step 3: Clip to -1.0/1.0 and then scale to Int16
                         audio_data_int16 = (np.clip(clean_buffer, -1.0, 1.0) * 32767).astype(np.int16)
                         
-                        # Step 4: Convert back to bytes for Google STT
+                        # Step 3: Convert back to bytes for Google STT
                         audio_data = audio_data_int16.tobytes()
                         
                         logger.debug(f"🔄 Float32→Int16 transformation: {len(float_buffer)} samples * 32767")
