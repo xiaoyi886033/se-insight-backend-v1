@@ -104,10 +104,15 @@ class GeminiAPIService:
             self.is_configured = False
             return
             
-        self.api_url = "https://generativelanguage.googleapis.com/v1/models/gemini-1.5-flash:generateContent"
+        self.api_url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent"
         
         # Optimized system instruction for gemini-1.5-flash real-time processing
         self.system_instruction = """You are a Senior Software Engineering Professor analyzing real-time transcripts. Detect specialized SE terms (e.g., polymorphism, CI/CD, microservices, algorithms) and provide concise Chinese explanations (under 40 words). Return JSON format: {"original_text": "...", "keywords": [{"term": "term_name", "explanation": "Chinese_explanation"}]}. Empty keywords list if no SE terms found. No conversational text."""
+        
+        # Buffer mechanism to prevent too-frequent API calls
+        self.last_analysis_time = 0
+        self.min_interval = 2.0  # Minimum 2 seconds between Gemini API calls
+        self.pending_transcripts = []
         
         self.is_configured = True
         logger.info("✅ Gemini API service configured with gemini-1.5-flash for real-time SE term explanations")
@@ -123,6 +128,20 @@ class GeminiAPIService:
         """
         if not self.is_configured or not transcript_text.strip():
             return None
+        
+        # Buffer mechanism: Only call Gemini API every 2+ seconds
+        current_time = time.time()
+        if current_time - self.last_analysis_time < self.min_interval:
+            logger.debug(f"⏰ Gemini API call buffered - waiting {self.min_interval}s interval")
+            self.pending_transcripts.append(transcript_text)
+            return None
+        
+        # Process accumulated transcripts
+        if self.pending_transcripts:
+            transcript_text = " ".join(self.pending_transcripts + [transcript_text])
+            self.pending_transcripts.clear()
+        
+        self.last_analysis_time = current_time
         
         try:
             # Prepare the prompt with system instruction and transcript
@@ -162,18 +181,19 @@ class GeminiAPIService:
                 ]
             }
             
-            # Make async HTTP request to Gemini API
+            # Make async HTTP request to Gemini API with API key as query parameter
             headers = {
                 "Content-Type": "application/json"
             }
             
+            # Ensure API key is passed as query parameter for Railway compatibility
             url = f"{self.api_url}?key={self.api_key}"
             
             logger.info(f"🤖 Making Gemini API request to: {self.api_url}")
             logger.debug(f"📝 Analyzing transcript: {transcript_text[:100]}...")
             
             async with aiohttp.ClientSession() as session:
-                async with session.post(url, json=payload, headers=headers, timeout=10) as response:
+                async with session.post(url, json=payload, headers=headers, timeout=15) as response:
                     if response.status == 200:
                         result = await response.json()
                         logger.info("✅ Gemini API request successful")
@@ -181,11 +201,12 @@ class GeminiAPIService:
                     else:
                         error_text = await response.text()
                         logger.error(f"❌ Gemini API error {response.status}: {error_text}")
-                        logger.error(f"🔍 Request URL: {self.api_url}")
+                        logger.error(f"🔍 Request URL: {url}")
+                        logger.error(f"🔑 API Key configured: {bool(self.api_key)}")
                         return None
                         
         except asyncio.TimeoutError:
-            logger.warning("⏰ Gemini API request timeout")
+            logger.warning("⏰ Gemini API request timeout (15s)")
             return None
         except Exception as e:
             logger.error(f"❌ Gemini API request failed: {e}")
