@@ -916,18 +916,33 @@ async def request_generator(audio_queue, streaming_config):
             
             last_data_time = time.time()
             
-            # 步骤2: CRITICAL FIX - 验证数据转换
+            # 步骤2: CRITICAL FIX - 添加清洁过滤器处理音频信号
+            # 第一步：数据清洗 (The Filter)
+            # 必须先执行 nan_to_num，防止乘法运算使数据崩溃
             float_data = np.frombuffer(data, dtype=np.float32)
-            int16_data = (np.clip(np.nan_to_num(float_data), -1.0, 1.0) * 32767).astype(np.int16)
+            clean_float = np.nan_to_num(float_data, nan=0.0, posinf=1.0, neginf=-1.0)
+            
+            # 第二步：幅度剪裁 (Safety Clip)
+            # 确保数据严格在 -1.0 到 1.0 之间
+            clipped_float = np.clip(clean_float, -1.0, 1.0)
+            
+            # 第三步：量化转换 (Quantization)
+            # 现在的转换将是 100% 安全且物理有效的
+            int16_data = (clipped_float * 32767).astype(np.int16)
+            
+            # 第四步：计算 RMS 音量进行验证
+            # 只要这个值在 10000 到 30000 之间且不是 nan，就一定有声音
+            rms_val = np.sqrt(np.mean(int16_data.astype(np.float32)**2))
+            print(f"DEBUG - 清洗后音量: {rms_val}")
             
             # 步骤2: 验证转换结果
             print(f"DEBUG - Data conversion: {len(float_data)} float32 → {len(int16_data)} int16")
             
             local_buffer.extend(int16_data.tobytes())
             
-            # 积压至 1600 字节 (50ms) 再 yield - 步骤2: 降低阈值用于测试
-            if len(local_buffer) >= 1600:
-                print(f"DEBUG - Sending 1600 bytes")
+            # 恢复 3200 字节 (100ms) 缓冲区 - 移除测试用的1600字节
+            if len(local_buffer) >= 3200:
+                print(f"DEBUG - Sending 3200 bytes")
                 yield speech.StreamingRecognizeRequest(audio_content=bytes(local_buffer))
                 local_buffer.clear()
                 
