@@ -1100,14 +1100,10 @@ async def process_streaming_responses(websocket: WebSocket, session_data: Sessio
         async for response in responses:
             if not response.results: 
                 continue
-                
             result = response.results[0]
             transcript = result.alternatives[0].transcript
-            
-            # 核心日志：如果这里印出字了，说明后端彻底成功
-            print(f"DEBUG - 收到识别文字: {transcript} (是否最终结果: {result.is_final})")
-            
-            # 通过 WebSocket 发送给前端
+            # 只要有字就打印并发送，不要管 is_final
+            print(f"DEBUG - 实时字幕: {transcript} (Final: {result.is_final})")
             await websocket.send_json({
                 "type": "transcript",
                 "text": transcript,
