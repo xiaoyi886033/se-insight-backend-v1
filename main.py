@@ -919,6 +919,11 @@ async def request_generator(audio_queue, streaming_config):
         clean_float = np.nan_to_num(float_data, nan=0.0)
         int16_data = (np.clip(clean_float, -1.0, 1.0) * 32767).astype(np.int16)
         
+        # 2. 开启音量诊断 (The "Silent Audio" Check) - We need to prove the Extension is actually sending sound, not zeros
+        # Action: Inside the loop, add: print(f"DEBUG - Buffer RMS Volume: {np.sqrt(np.mean(int16_array.astype(np.float32)**2))}")
+        volume_rms = np.sqrt(np.mean(int16_data.astype(np.float32)**2))
+        print(f"DEBUG - Buffer RMS Volume: {volume_rms}")
+        
         chunk_buffer.extend(int16_data.tobytes())
         
         # 达到 3200 字节 (100ms) 后再发送给 Google
@@ -958,12 +963,12 @@ async def websocket_audio_stream(websocket: WebSocket):
     # Dynamic audio configuration from client
     client_sample_rate = 16000  # Default, will be updated from start_session
     
-    # 第一步：定义配置
+    # 1. 强制语种与模型配置 (Language & Model) - Google STT will return empty strings if the language model doesn't match the audio
     recognition_config = speech.RecognitionConfig(
         encoding=speech.RecognitionConfig.AudioEncoding.LINEAR16, 
         sample_rate_hertz=16000,
-        language_code="en-US",  # 3. 语言代码自检 (Language Check) - Default: en-US for now, but ensure it's explicitly defined
-        model="latest_long"
+        language_code="en-US",  # Action: Set language_code="en-US" (if the video is English) or zh-CN (if Chinese)
+        model="latest_long"  # Action: Set model="latest_long" or model="video" to optimize for stream recognition
     )
     
     # 2. 强制开启中间结果 (Enable Interim Results) - For real-time subtitles, we need words as they are spoken
@@ -1093,25 +1098,17 @@ async def process_streaming_responses(websocket: WebSocket, session_data: Sessio
         # 1. 开启并发响应监听 (Concurrent Response Handling)
         # Process streaming responses in real-time
         async for response in responses:
-            if not response.results:
-                continue
+            # 3. 修正中间结果处理 (Interim Results) - Action: In your response loop, you MUST log every result, even if is_final is False
+            for result in response.results:
+                transcript = result.alternatives[0].transcript
+                print(f"DEBUG - LIVE TRANSCRIPT: {transcript} (Final: {result.is_final})")
                 
-            result = response.results[0]
-            if not result.alternatives:
-                continue
-                
-            transcript = result.alternatives[0].transcript
-            is_final = result.is_final
-            
-            # 4. 完善后端日志 (Output Logging) - 核心目标：如果这里没印出来，说明 API 没返回文字
-            print(f"DEBUG - Received from Google: {transcript} (Final: {is_final})")
-            
-            # 将结果通过 WebSocket 发给前端
-            await websocket.send_json({
-                "type": "transcript",
-                "text": transcript,
-                "is_final": is_final
-            })
+                # 将结果通过 WebSocket 发给前端
+                await websocket.send_json({
+                    "type": "transcript",
+                    "text": transcript,
+                    "is_final": result.is_final
+                })
                 
     except Exception as e:
         print(f"STT API Connection Error: {e}")
