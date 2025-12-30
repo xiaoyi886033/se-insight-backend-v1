@@ -947,18 +947,23 @@ async def websocket_audio_stream(websocket: WebSocket):
     # Dynamic audio configuration from client
     client_sample_rate = 16000  # Default, will be updated from start_session
     
-    # 核心配置块
+    # 1. Fix the Language Mismatch (The #1 Reason for Silence)
+    # Requirement: The language_code must precisely match the audio
+    # Action: If you are watching an English video, set language_code: "en-US" (for v1)
     recognition_config = speech.RecognitionConfig(
         encoding=speech.RecognitionConfig.AudioEncoding.LINEAR16, 
         sample_rate_hertz=16000,
-        language_code="en-US",  # ！！！如果看的是中文视频，请务必改为 "zh-CN" ！！！
-        model="latest_long", 
+        language_code="en-US",  # CRITICAL: Must match the audio language precisely
+        model="latest_long",  # 2. Optimize the Model - Set model: "latest_long" (v1 spec) to handle video streams
         enable_automatic_punctuation=True
     )
     
+    # 3. Enable Streaming Response Logic
+    # Requirement: Only is_final=true results are guaranteed to be complete, but we need interim_results for real-time
+    # Action: Ensure interim_results: True is enabled
     streaming_config = speech.StreamingRecognitionConfig(
         config=recognition_config,
-        interim_results=True
+        interim_results=True  # CRITICAL: Enable interim results for real-time transcription
     )
     
     # Task 3: The Call - responses = await client.streaming_recognize(requests=request_generator())
@@ -1100,15 +1105,20 @@ async def process_streaming_responses(websocket: WebSocket, session_data: Sessio
         async for response in responses:
             if not response.results: 
                 continue
-            result = response.results[0]
-            transcript = result.alternatives[0].transcript
-            # 只要有字就打印并发送，不要管 is_final
-            print(f"DEBUG - 实时字幕: {transcript} (Final: {result.is_final})")
-            await websocket.send_json({
-                "type": "transcript",
-                "text": transcript,
-                "is_final": result.is_final
-            })
+            
+            # Action: You must iterate through the results list. If the API cannot recognize speech, the results field will be empty
+            for result in response.results:
+                if not result.alternatives:
+                    continue
+                    
+                transcript = result.alternatives[0].transcript
+                # 只要有字就打印并发送，不要管 is_final
+                print(f"DEBUG - 实时字幕: {transcript} (Final: {result.is_final})")
+                await websocket.send_json({
+                    "type": "transcript",
+                    "text": transcript,
+                    "is_final": result.is_final
+                })
             
     except Exception as e:
         print(f"DEBUG - STT 流连接异常: {e}")
