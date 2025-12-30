@@ -979,7 +979,6 @@ async def websocket_audio_stream(websocket: WebSocket):
         enable_automatic_punctuation=True,
         enable_word_confidence=True
     )
-    )
     
     # Task 4: Session Persistence - Ensure interim_results=True is active so we see partial text immediately
     config = speech.StreamingRecognitionConfig(
