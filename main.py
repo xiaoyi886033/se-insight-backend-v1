@@ -905,18 +905,38 @@ async def get_se_term_definition(term: str):
 async def request_generator(audio_queue, streaming_config):
     yield speech.StreamingRecognizeRequest(streaming_config=streaming_config)
     local_buffer = bytearray()
+    last_data_time = time.time()
+    
     while True:
-        data = await audio_queue.get()
-        if data is None:
-            break
-        # 数字转换与清洗
-        float_data = np.frombuffer(data, dtype=np.float32)
-        int16_data = (np.clip(np.nan_to_num(float_data), -1.0, 1.0) * 32767).astype(np.int16)
-        local_buffer.extend(int16_data.tobytes())
-        # 积压至 3200 字节 (100ms) 再 yield
-        if len(local_buffer) >= 3200:
-            yield speech.StreamingRecognizeRequest(audio_content=bytes(local_buffer))
-            local_buffer.clear()
+        try:
+            # 步骤2: 添加1秒超时检测
+            data = await asyncio.wait_for(audio_queue.get(), timeout=1.0)
+            if data is None:
+                break
+            
+            last_data_time = time.time()
+            
+            # 步骤2: CRITICAL FIX - 验证数据转换
+            float_data = np.frombuffer(data, dtype=np.float32)
+            int16_data = (np.clip(np.nan_to_num(float_data), -1.0, 1.0) * 32767).astype(np.int16)
+            
+            # 步骤2: 验证转换结果
+            print(f"DEBUG - Data conversion: {len(float_data)} float32 → {len(int16_data)} int16")
+            
+            local_buffer.extend(int16_data.tobytes())
+            
+            # 积压至 1600 字节 (50ms) 再 yield - 步骤2: 降低阈值用于测试
+            if len(local_buffer) >= 1600:
+                print(f"DEBUG - Sending 1600 bytes")
+                yield speech.StreamingRecognizeRequest(audio_content=bytes(local_buffer))
+                local_buffer.clear()
+                
+        except asyncio.TimeoutError:
+            # 步骤2: 超时检测
+            print("DEBUG - Audio stream timed out")
+            if time.time() - last_data_time > 1.0:
+                print("DEBUG - No audio data received for 1 second")
+            continue
 
 @app.websocket("/ws/audio")
 async def websocket_audio_stream(websocket: WebSocket):
@@ -948,8 +968,11 @@ async def websocket_audio_stream(websocket: WebSocket):
     # Dynamic audio configuration from client
     client_sample_rate = 16000  # Default, will be updated from start_session
     
-    # 1. 核心配置逻辑 (维度: 频道对齐)
-    # 确保 RecognitionConfig 包含以下参数。注意：如果视频是英文，必须锁定为 en-US
+    # 步骤3: 对齐 Google 官方规范 (API Config)
+    # Requirement: RecognitionConfig must be the FIRST message
+    # Action: Set language_code="en-US", encoding="LINEAR16", sample_rate_hertz=16000
+    # Action: Ensure interim_results=True is enabled in the config
+    
     recognition_config = speech.RecognitionConfig(
         encoding=speech.RecognitionConfig.AudioEncoding.LINEAR16, 
         sample_rate_hertz=16000,
@@ -962,6 +985,10 @@ async def websocket_audio_stream(websocket: WebSocket):
         config=recognition_config,
         interim_results=True
     )
+    
+    # 步骤3: Log Requirement - 验证配置
+    print(f"DEBUG - Google STT Config: language={recognition_config.language_code}, encoding={recognition_config.encoding}, rate={recognition_config.sample_rate_hertz}")
+    print(f"DEBUG - Streaming Config: interim_results={streaming_config.interim_results}")
     
     # 3. 流式调用逻辑 (维度: 双向打通)
     # 将请求生成器与响应处理逻辑结合:
