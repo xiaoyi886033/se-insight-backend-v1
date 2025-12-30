@@ -970,16 +970,6 @@ async def websocket_audio_stream(websocket: WebSocket):
     # Dynamic audio configuration from client
     client_sample_rate = 16000  # Default, will be updated from start_session
     
-    # Task 3: Create recognition config for async generator
-    recognition_config = speech_v1.RecognitionConfig(
-        encoding=speech_v1.RecognitionConfig.AudioEncoding.LINEAR16,
-        sample_rate_hertz=16000,
-        language_code="en-US",
-        model="latest_long",
-        enable_automatic_punctuation=True,
-        enable_word_confidence=True
-    )
-    
     # Task 2: Implement the Three-Dimension Specs - Physical: Force encoding=speech.RecognitionConfig.AudioEncoding.LINEAR16 and sample_rate_hertz=16000
     recognition_config = speech.RecognitionConfig(
         encoding=speech.RecognitionConfig.AudioEncoding.LINEAR16,  # Physical: Force LINEAR16
@@ -988,6 +978,7 @@ async def websocket_audio_stream(websocket: WebSocket):
         model="latest_long",
         enable_automatic_punctuation=True,
         enable_word_confidence=True
+    )
     )
     
     # Task 4: Session Persistence - Ensure interim_results=True is active so we see partial text immediately
