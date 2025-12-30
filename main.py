@@ -901,43 +901,31 @@ async def get_se_term_definition(term: str):
         "related_terms": term_def.related_terms
     }
 
-# Task 2: Implement the Three-Dimension Specs - Temporal: MANDATORY BUFFERING
+# 第二步：异步生成器实现 (100ms 积压逻辑)
 async def request_generator(audio_queue, streaming_config):
-    """Task 2: Three-Dimension Specs Implementation
-    
-    Physical: Force encoding=speech.RecognitionConfig.AudioEncoding.LINEAR16 and sample_rate_hertz=16000
-    Math: Use np.clip(np.nan_to_num(audio_data) * 32767, -32768, 32767).astype(np.int16)
-    Temporal: MANDATORY BUFFERING. Do NOT yield audio to the gRPC stream until you have exactly 3200 bytes (100ms)
-    """
-    # Dimension 3: First packet MUST be config yield
+    """首包必须是配置 yield"""
     yield speech.StreamingRecognizeRequest(streaming_config=streaming_config)
-    print("DEBUG - Yielded config to gRPC")
     
-    # Buffer for Temporal Aggregation (100ms) - MANDATORY BUFFERING
-    accumulated_buffer = bytearray()
+    # 初始化 100ms 积压缓冲
+    chunk_buffer = bytearray()
     
-    while True:  # Receiving small 42-byte packets from WebSocket
-        try:
-            chunk = await audio_queue.get()
-            if chunk is None:  # break
-                break
-            
-            # Task 2: Math - Use np.clip(np.nan_to_num(audio_data) * 32767, -32768, 32767).astype(np.int16)
-            float_array = np.frombuffer(chunk, dtype=np.float32)
-            clean_float = np.nan_to_num(float_array, nan=0.0)
-            int16_array = (np.clip(clean_float, -1.0, 1.0) * 32767).astype(np.int16)
-            
-            accumulated_buffer.extend(int16_array.tobytes())
-            
-            # Task 2: Temporal - MANDATORY BUFFERING. Do NOT yield until exactly 3200 bytes (100ms)
-            if len(accumulated_buffer) >= 3200:
-                print(f"DEBUG - Sending 3200 bytes chunk to gRPC")
-                yield speech.StreamingRecognizeRequest(audio_content=bytes(accumulated_buffer))
-                accumulated_buffer.clear()
-                
-        except Exception as e:
-            logger.error(f"❌ Generator error: {e}")
+    while True:
+        data = await audio_queue.get()
+        if data is None: 
             break
+        
+        # 数学清洗与 Int16 转换
+        float_data = np.frombuffer(data, dtype=np.float32)
+        clean_float = np.nan_to_num(float_data, nan=0.0)
+        int16_data = (np.clip(clean_float, -1.0, 1.0) * 32767).astype(np.int16)
+        
+        chunk_buffer.extend(int16_data.tobytes())
+        
+        # 达到 3200 字节 (100ms) 后再发送给 Google
+        if len(chunk_buffer) >= 3200:
+            print(f"DEBUG - Sending 3200 bytes chunk")
+            yield speech.StreamingRecognizeRequest(audio_content=bytes(chunk_buffer))
+            chunk_buffer.clear()
 
 @app.websocket("/ws/audio")
 async def websocket_audio_stream(websocket: WebSocket):
@@ -970,21 +958,17 @@ async def websocket_audio_stream(websocket: WebSocket):
     # Dynamic audio configuration from client
     client_sample_rate = 16000  # Default, will be updated from start_session
     
-    # Task 2: Implement the Three-Dimension Specs - Physical: Force encoding=speech.RecognitionConfig.AudioEncoding.LINEAR16 and sample_rate_hertz=16000
+    # 第一步：定义配置
     recognition_config = speech.RecognitionConfig(
-        encoding=speech.RecognitionConfig.AudioEncoding.LINEAR16,  # Physical: Force LINEAR16
-        sample_rate_hertz=16000,  # Physical: Force 16000
-        language_code="en-US",
-        model="latest_long",
-        enable_automatic_punctuation=True,
-        enable_word_confidence=True
+        encoding=speech.RecognitionConfig.AudioEncoding.LINEAR16, 
+        sample_rate_hertz=16000,
+        language_code="en-US", 
+        model="latest_long"
     )
     
-    # Task 4: Session Persistence - Ensure interim_results=True is active so we see partial text immediately
-    config = speech.StreamingRecognitionConfig(
+    streaming_config = speech.StreamingRecognitionConfig(
         config=recognition_config,
-        interim_results=True,  # Ensure interim_results=True is active so we see partial text immediately
-        single_utterance=False  # Keep stream open for continuous audio
+        interim_results=True
     )
     
     # Task 3: The Call - responses = await client.streaming_recognize(requests=request_generator())
@@ -993,7 +977,7 @@ async def websocket_audio_stream(websocket: WebSocket):
     if google_client.client:
         try:
             # Start the async streaming recognition with AsyncRetry
-            streaming_task = asyncio.create_task(process_streaming_responses(websocket, session_data, audio_queue, config))
+            streaming_task = asyncio.create_task(process_streaming_responses(websocket, session_data, audio_queue, streaming_config))
         except Exception as e:
             logger.error(f"❌ Failed to start streaming recognition: {e}")
     
@@ -1091,19 +1075,15 @@ async def websocket_audio_stream(websocket: WebSocket):
             
             del active_sessions[session_id]
 
-async def process_streaming_responses(websocket: WebSocket, session_data: SessionData, audio_queue: asyncio.Queue, config):
-    """Process streaming recognition responses using async generator pattern
-    
-    正确的异步流式调用 (修复缺少参数的报错)
-    """
+async def process_streaming_responses(websocket: WebSocket, session_data: SessionData, audio_queue: asyncio.Queue, streaming_config):
+    """第三步：正确的异步流式调用 (修复括号不匹配问题)"""
     if not google_client.client:
         logger.error("❌ Google Speech AsyncClient not initialized")
         return
     
     try:
-        # 正确的异步流式调用 - Fix missing parameters error
         responses = await google_client.client.streaming_recognize(
-            requests=request_generator(audio_queue, config), 
+            requests=request_generator(audio_queue, streaming_config), 
             retry=retries.AsyncRetry()
         )
         
@@ -1120,7 +1100,7 @@ async def process_streaming_responses(websocket: WebSocket, session_data: Sessio
                         confidence = result.alternatives[0].confidence if result.alternatives[0].confidence else 0.0
                         current_time = time.time()
                         
-                        # 白标标志: 部署后，日志中必须不再出现 SyntaxError，且必须出现类似 DEBUG - Sending 3200 bytes chunk 的信息
+                        # 部署验证：部署后，日志中必须不再出现 SyntaxError，且应出现类似 DEBUG - Sending 3200 bytes chunk 的记录
                         if transcript_text.strip():
                             print(f"DEBUG - Raw Transcript: '{transcript_text}' (final: {is_final})")
                             logger.info(f"📝 Google STT: \"{transcript_text}\" (final: {is_final})")
@@ -1181,7 +1161,7 @@ async def process_streaming_responses(websocket: WebSocket, session_data: Sessio
                 continue
                 
     except Exception as e:
-        logger.error(f"❌ STT API Connection Error: {e}")
+        print(f"STT API Connection Error: {e}")
 
 if __name__ == "__main__":
     # Production deployment - Railway uses Procfile, this is for local development only
