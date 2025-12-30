@@ -901,36 +901,17 @@ async def get_se_term_definition(term: str):
         "related_terms": term_def.related_terms
     }
 
-# 第二步：异步生成器实现 (100ms 积压逻辑)
+# 异步生成器 (必须先发配置，再发100ms积压音频)
 async def request_generator(audio_queue, streaming_config):
-    """首包必须是配置 yield"""
+    # 必须先发配置
     yield speech.StreamingRecognizeRequest(streaming_config=streaming_config)
     
-    # 初始化 100ms 积压缓冲
-    chunk_buffer = bytearray()
-    
     while True:
-        data = await audio_queue.get()
-        if data is None: 
+        chunk = await audio_queue.get()
+        if chunk is None: 
             break
-        
-        # 数学清洗与 Int16 转换
-        float_data = np.frombuffer(data, dtype=np.float32)
-        clean_float = np.nan_to_num(float_data, nan=0.0)
-        int16_data = (np.clip(clean_float, -1.0, 1.0) * 32767).astype(np.int16)
-        
-        # 2. 开启音量诊断 (The "Silent Audio" Check) - We need to prove the Extension is actually sending sound, not zeros
-        # Action: Inside the loop, add: print(f"DEBUG - Buffer RMS Volume: {np.sqrt(np.mean(int16_array.astype(np.float32)**2))}")
-        volume_rms = np.sqrt(np.mean(int16_data.astype(np.float32)**2))
-        print(f"DEBUG - Buffer RMS Volume: {volume_rms}")
-        
-        chunk_buffer.extend(int16_data.tobytes())
-        
-        # 达到 3200 字节 (100ms) 后再发送给 Google
-        if len(chunk_buffer) >= 3200:
-            print(f"DEBUG - Sending 3200 bytes chunk")
-            yield speech.StreamingRecognizeRequest(audio_content=bytes(chunk_buffer))
-            chunk_buffer.clear()
+        # 发送3200字节 (100ms) 的数据块
+        yield speech.StreamingRecognizeRequest(audio_content=chunk)
 
 @app.websocket("/ws/audio")
 async def websocket_audio_stream(websocket: WebSocket):
@@ -957,24 +938,27 @@ async def websocket_audio_stream(websocket: WebSocket):
     # Task 3: Use asyncio.Queue for async generator pattern
     audio_queue = asyncio.Queue()
     
+    # 音频缓冲区用于100ms积压
+    audio_buffer = bytearray()
+    
     last_gemini_call = 0
     gemini_interval = 2.0  # Minimum 2 seconds between Gemini calls
     
     # Dynamic audio configuration from client
     client_sample_rate = 16000  # Default, will be updated from start_session
     
-    # 1. 强制语种与模型配置 (Language & Model) - Google STT will return empty strings if the language model doesn't match the audio
+    # 核心配置块
     recognition_config = speech.RecognitionConfig(
         encoding=speech.RecognitionConfig.AudioEncoding.LINEAR16, 
         sample_rate_hertz=16000,
-        language_code="en-US",  # Action: Set language_code="en-US" (if the video is English) or zh-CN (if Chinese)
-        model="latest_long"  # Action: Set model="latest_long" or model="video" to optimize for stream recognition
+        language_code="en-US",  # ！！！如果看的是中文视频，请务必改为 "zh-CN" ！！！
+        model="latest_long", 
+        enable_automatic_punctuation=True
     )
     
-    # 2. 强制开启中间结果 (Enable Interim Results) - For real-time subtitles, we need words as they are spoken
     streaming_config = speech.StreamingRecognitionConfig(
         config=recognition_config,
-        interim_results=True  # Action: Set interim_results=True in the StreamingRecognitionConfig
+        interim_results=True
     )
     
     # Task 3: The Call - responses = await client.streaming_recognize(requests=request_generator())
@@ -1023,15 +1007,35 @@ async def websocket_audio_stream(websocket: WebSocket):
                         continue
                 
                 if "bytes" in message:
-                    # Process audio data - Send directly to queue for proper buffering
+                    # 音频数据处理 - 添加缓冲和RMS音量检查
                     audio_data = message["bytes"]
                     logger.debug(f"📨 Received {len(audio_data)} bytes from {client_id}")
                     
-                    # Send raw audio data to queue for buffering and processing
+                    # 数学清洗与Int16转换
                     try:
-                        audio_queue.put_nowait(audio_data)
-                    except asyncio.QueueFull:
-                        logger.warning("⚠️ Audio processing queue full - dropping chunk")
+                        float_data = np.frombuffer(audio_data, dtype=np.float32)
+                        clean_float = np.nan_to_num(float_data, nan=0.0)
+                        int16_data = (np.clip(clean_float, -1.0, 1.0) * 32767).astype(np.int16)
+                        
+                        # 2. 确认RMS Volume：只要日志里维续出现 RMS Volume: 25000 左右的数字，就证明前端和转换逻辑没有任何问题，禁止改动音频采集部分
+                        volume_rms = np.sqrt(np.mean(int16_data.astype(np.float32)**2))
+                        print(f"DEBUG - RMS Volume: {volume_rms}")
+                        
+                        # 添加到缓冲区
+                        audio_buffer.extend(int16_data.tobytes())
+                        
+                        # 达到3200字节(100ms)后发送
+                        if len(audio_buffer) >= 3200:
+                            print(f"DEBUG - Sending 3200 bytes chunk")
+                            try:
+                                audio_queue.put_nowait(bytes(audio_buffer))
+                                audio_buffer.clear()
+                            except asyncio.QueueFull:
+                                logger.warning("⚠️ Audio processing queue full - dropping chunk")
+                        
+                    except Exception as e:
+                        logger.error(f"❌ Audio processing error: {e}")
+                        continue
                     
     except WebSocketDisconnect:
         logger.info(f"🔌 WebSocket client disconnected: {client_id}")
@@ -1082,7 +1086,7 @@ async def websocket_audio_stream(websocket: WebSocket):
             del active_sessions[session_id]
 
 async def process_streaming_responses(websocket: WebSocket, session_data: SessionData, audio_queue: asyncio.Queue, streaming_config):
-    """第三步：正确的异步流式调用 (修复括号不匹配问题)"""
+    """修正后的响应监听循环 (确保文字能打印并发出)"""
     if not google_client.client:
         logger.error("❌ Google Speech AsyncClient not initialized")
         return
@@ -1093,25 +1097,25 @@ async def process_streaming_responses(websocket: WebSocket, session_data: Sessio
             retry=retries.AsyncRetry()
         )
         
-        logger.info("✅ Async streaming recognition started with AsyncRetry")
-        
-        # 1. 开启并发响应监听 (Concurrent Response Handling)
-        # Process streaming responses in real-time
         async for response in responses:
-            # 3. 修正中间结果处理 (Interim Results) - Action: In your response loop, you MUST log every result, even if is_final is False
-            for result in response.results:
-                transcript = result.alternatives[0].transcript
-                print(f"DEBUG - LIVE TRANSCRIPT: {transcript} (Final: {result.is_final})")
+            if not response.results: 
+                continue
                 
-                # 将结果通过 WebSocket 发给前端
-                await websocket.send_json({
-                    "type": "transcript",
-                    "text": transcript,
-                    "is_final": result.is_final
-                })
-                
+            result = response.results[0]
+            transcript = result.alternatives[0].transcript
+            
+            # 核心日志：如果这里印出字了，说明后端彻底成功
+            print(f"DEBUG - 收到识别文字: {transcript} (是否最终结果: {result.is_final})")
+            
+            # 通过 WebSocket 发送给前端
+            await websocket.send_json({
+                "type": "transcript",
+                "text": transcript,
+                "is_final": result.is_final
+            })
+            
     except Exception as e:
-        print(f"STT API Connection Error: {e}")
+        print(f"DEBUG - STT 流连接异常: {e}")
 
 if __name__ == "__main__":
     # Production deployment - Railway uses Procfile, this is for local development only
