@@ -962,13 +962,14 @@ async def websocket_audio_stream(websocket: WebSocket):
     recognition_config = speech.RecognitionConfig(
         encoding=speech.RecognitionConfig.AudioEncoding.LINEAR16, 
         sample_rate_hertz=16000,
-        language_code="en-US", 
+        language_code="en-US",  # 3. 语言代码自检 (Language Check) - Default: en-US for now, but ensure it's explicitly defined
         model="latest_long"
     )
     
+    # 2. 强制开启中间结果 (Enable Interim Results) - For real-time subtitles, we need words as they are spoken
     streaming_config = speech.StreamingRecognitionConfig(
         config=recognition_config,
-        interim_results=True
+        interim_results=True  # Action: Set interim_results=True in the StreamingRecognitionConfig
     )
     
     # Task 3: The Call - responses = await client.streaming_recognize(requests=request_generator())
@@ -1089,76 +1090,28 @@ async def process_streaming_responses(websocket: WebSocket, session_data: Sessio
         
         logger.info("✅ Async streaming recognition started with AsyncRetry")
         
+        # 1. 开启并发响应监听 (Concurrent Response Handling)
         # Process streaming responses in real-time
         async for response in responses:
-            try:
-                # Process each streaming response
-                for result in response.results:
-                    if result.alternatives:
-                        transcript_text = result.alternatives[0].transcript
-                        is_final = result.is_final
-                        confidence = result.alternatives[0].confidence if result.alternatives[0].confidence else 0.0
-                        current_time = time.time()
-                        
-                        # 部署验证：部署后，日志中必须不再出现 SyntaxError，且应出现类似 DEBUG - Sending 3200 bytes chunk 的记录
-                        if transcript_text.strip():
-                            print(f"DEBUG - Raw Transcript: '{transcript_text}' (final: {is_final})")
-                            logger.info(f"📝 Google STT: \"{transcript_text}\" (final: {is_final})")
-                            
-                            # Process SE terms and Gemini analysis
-                            detected_terms = se_knowledge_base.detect_se_terms(transcript_text)
-                            
-                            # Check if should process Gemini (only for final results)
-                            should_process_gemini_now = (
-                                is_final and
-                                transcript_text.strip()
-                            )
-                            
-                            gemini_analysis = None
-                            if should_process_gemini_now:
-                                try:
-                                    gemini_analysis = await gemini_service.analyze_transcript(transcript_text)
-                                    if gemini_analysis:
-                                        logger.info(f"🤖 Gemini analysis: {len(gemini_analysis.keywords)} explanations")
-                                except Exception as e:
-                                    logger.error(f"❌ Gemini analysis failed: {e}")
-                            
-                            # Send results to WebSocket
-                            response_data = {
-                                "type": "transcription_result",
-                                "text": transcript_text,
-                                "is_final": is_final,
-                                "confidence": confidence,
-                                "timestamp": current_time,
-                                "se_terms": detected_terms,
-                                "se_definitions": {},
-                            }
-                            
-                            # Add Gemini analysis if available
-                            if gemini_analysis and gemini_analysis.keywords:
-                                response_data["gemini_analysis"] = {
-                                    "original_text": gemini_analysis.original_text,
-                                    "keywords": [
-                                        {"term": kw.term, "explanation": kw.explanation}
-                                        for kw in gemini_analysis.keywords
-                                    ]
-                                }
-                            
-                            try:
-                                await websocket.send_text(json.dumps(response_data))
-                                logger.info(f"📤 Sent transcription result (final: {is_final})")
-                            except Exception as send_error:
-                                logger.error(f"❌ WebSocket send error: {send_error}")
-                            
-                            # Update session data
-                            if is_final:
-                                session_data.transcripts.append(transcript_text)
-                                session_data.se_terms_detected.extend(detected_terms)
-                                session_data.se_terms_detected = list(set(session_data.se_terms_detected))
-                    
-            except Exception as response_error:
-                logger.error(f"❌ Streaming response processing error: {response_error}")
+            if not response.results:
                 continue
+                
+            result = response.results[0]
+            if not result.alternatives:
+                continue
+                
+            transcript = result.alternatives[0].transcript
+            is_final = result.is_final
+            
+            # 4. 完善后端日志 (Output Logging) - 核心目标：如果这里没印出来，说明 API 没返回文字
+            print(f"DEBUG - Received from Google: {transcript} (Final: {is_final})")
+            
+            # 将结果通过 WebSocket 发给前端
+            await websocket.send_json({
+                "type": "transcript",
+                "text": transcript,
+                "is_final": is_final
+            })
                 
     except Exception as e:
         print(f"STT API Connection Error: {e}")
