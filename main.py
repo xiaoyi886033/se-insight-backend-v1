@@ -25,8 +25,8 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
-# Google Cloud Speech imports - Task 3: Use speech_v1.SpeechAsyncClient
-# Fix 1: Import and use google.api_core.retry_async.AsyncRetry instead of sync version
+# Google Cloud Speech imports - Task 1: Fix Imports & Naming (Dimension 0)
+# Action: Use this exact import: from google.cloud import speech_v1 as speech
 try:
     from google.cloud import speech_v1 as speech
     from google.api_core import retry_async as retries
@@ -740,7 +740,7 @@ class GoogleSpeechClient:
                 # Set environment variable for Google client
                 os.environ['GOOGLE_APPLICATION_CREDENTIALS'] = temp_file.name
                 
-                # Task 3: Initialize SpeechAsyncClient for async generator support
+                # Task 1: Initialize SpeechAsyncClient - Update all references from speech_v1.RecognitionConfig to speech.RecognitionConfig
                 self.client = speech.SpeechAsyncClient()
                 logger.info("✅ Google Speech v1 AsyncClient initialized with GCP_KEY_JSON")
                 
@@ -901,17 +901,19 @@ async def get_se_term_definition(term: str):
         "related_terms": term_def.related_terms
     }
 
-# Task 3: Async Streaming Implementation (The Core Bug)
+# Task 2: Implement the Three-Dimension Specs - Temporal: MANDATORY BUFFERING
 async def request_generator(audio_queue, streaming_config):
-    """Dimension 3: First packet MUST be config yield
+    """Task 2: Three-Dimension Specs Implementation
     
-    Implementation: Replace the existing audio_generator or stream request loop with proper buffering
+    Physical: Force encoding=speech.RecognitionConfig.AudioEncoding.LINEAR16 and sample_rate_hertz=16000
+    Math: Use np.clip(np.nan_to_num(audio_data) * 32767, -32768, 32767).astype(np.int16)
+    Temporal: MANDATORY BUFFERING. Do NOT yield audio to the gRPC stream until you have exactly 3200 bytes (100ms)
     """
     # Dimension 3: First packet MUST be config yield
     yield speech.StreamingRecognizeRequest(streaming_config=streaming_config)
     print("DEBUG - Yielded config to gRPC")
     
-    # Buffer for Temporal Aggregation (100ms)
+    # Buffer for Temporal Aggregation (100ms) - MANDATORY BUFFERING
     accumulated_buffer = bytearray()
     
     while True:  # Receiving small 42-byte packets from WebSocket
@@ -920,16 +922,16 @@ async def request_generator(audio_queue, streaming_config):
             if chunk is None:  # break
                 break
             
-            # Dimension 2: Math Conversion & Sanitization
+            # Task 2: Math - Use np.clip(np.nan_to_num(audio_data) * 32767, -32768, 32767).astype(np.int16)
             float_array = np.frombuffer(chunk, dtype=np.float32)
             clean_float = np.nan_to_num(float_array, nan=0.0)
             int16_array = (np.clip(clean_float, -1.0, 1.0) * 32767).astype(np.int16)
             
             accumulated_buffer.extend(int16_array.tobytes())
             
-            # Dimension 3: Only yield when buffer >= 100ms (3200 bytes)
+            # Task 2: Temporal - MANDATORY BUFFERING. Do NOT yield until exactly 3200 bytes (100ms)
             if len(accumulated_buffer) >= 3200:
-                print(f"DEBUG - Sending 100ms Chunk (3200 bytes) to gRPC")
+                print(f"DEBUG - Sending 3200 bytes chunk to gRPC")
                 yield speech.StreamingRecognizeRequest(audio_content=bytes(accumulated_buffer))
                 accumulated_buffer.clear()
                 
@@ -978,10 +980,10 @@ async def websocket_audio_stream(websocket: WebSocket):
         enable_word_confidence=True
     )
     
-    # Task 4: Explicit LINEAR16 Parameters - Lock sample_rate_hertz to 16000 and encoding to LINEAR16
+    # Task 2: Implement the Three-Dimension Specs - Physical: Force encoding=speech.RecognitionConfig.AudioEncoding.LINEAR16 and sample_rate_hertz=16000
     recognition_config = speech.RecognitionConfig(
-        encoding=speech.RecognitionConfig.AudioEncoding.LINEAR16,  # Explicit LINEAR16
-        sample_rate_hertz=16000,  # Lock to 16000
+        encoding=speech.RecognitionConfig.AudioEncoding.LINEAR16,  # Physical: Force LINEAR16
+        sample_rate_hertz=16000,  # Physical: Force 16000
         language_code="en-US",
         model="latest_long",
         enable_automatic_punctuation=True,
