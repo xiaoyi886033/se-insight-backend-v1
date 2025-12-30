@@ -901,17 +901,22 @@ async def get_se_term_definition(term: str):
         "related_terms": term_def.related_terms
     }
 
-# 异步生成器 (必须先发配置，再发100ms积压音频)
+# 3. 带有 100ms 积压逻辑的生成器: async def request_generator(audio_queue): yield speech.StreamingRecognizeRequest(streaming_config=streaming_config) 
 async def request_generator(audio_queue, streaming_config):
-    # 必须先发配置
     yield speech.StreamingRecognizeRequest(streaming_config=streaming_config)
-    
+    local_buffer = bytearray()
     while True:
-        chunk = await audio_queue.get()
-        if chunk is None: 
+        data = await audio_queue.get()
+        if data is None:
             break
-        # 发送3200字节 (100ms) 的数据块
-        yield speech.StreamingRecognizeRequest(audio_content=chunk)
+        # 数字转换与清洗
+        float_data = np.frombuffer(data, dtype=np.float32)
+        int16_data = (np.clip(np.nan_to_num(float_data), -1.0, 1.0) * 32767).astype(np.int16)
+        local_buffer.extend(int16_data.tobytes())
+        # 积压至 3200 字节 (100ms) 再 yield
+        if len(local_buffer) >= 3200:
+            yield speech.StreamingRecognizeRequest(audio_content=bytes(local_buffer))
+            local_buffer.clear()
 
 @app.websocket("/ws/audio")
 async def websocket_audio_stream(websocket: WebSocket):
@@ -931,15 +936,11 @@ async def websocket_audio_stream(websocket: WebSocket):
     )
     active_sessions[session_id] = session_data
     
-    # Audio buffering for both Gemini API rate limiting AND Google STT chunk aggregation
-    audio_buffer = bytearray()
+    # Audio buffering for Gemini API rate limiting only
     buffer_size_threshold = 32000  # ~2 seconds of 16kHz mono audio (for Gemini)
     
     # Task 3: Use asyncio.Queue for async generator pattern
     audio_queue = asyncio.Queue()
-    
-    # 音频缓冲区用于100ms积压
-    audio_buffer = bytearray()
     
     last_gemini_call = 0
     gemini_interval = 2.0  # Minimum 2 seconds between Gemini calls
@@ -947,34 +948,46 @@ async def websocket_audio_stream(websocket: WebSocket):
     # Dynamic audio configuration from client
     client_sample_rate = 16000  # Default, will be updated from start_session
     
-    # 1. Fix the Language Mismatch (The #1 Reason for Silence)
-    # Requirement: The language_code must precisely match the audio
-    # Action: If you are watching an English video, set language_code: "en-US" (for v1)
+    # 1. 核心配置逻辑 (维度: 频道对齐)
+    # 确保 RecognitionConfig 包含以下参数。注意：如果视频是英文，必须锁定为 en-US
     recognition_config = speech.RecognitionConfig(
         encoding=speech.RecognitionConfig.AudioEncoding.LINEAR16, 
         sample_rate_hertz=16000,
-        language_code="en-US",  # CRITICAL: Must match the audio language precisely
-        model="latest_long",  # 2. Optimize the Model - Set model: "latest_long" (v1 spec) to handle video streams
+        language_code="en-US", 
+        model="latest_long", 
         enable_automatic_punctuation=True
     )
     
-    # 3. Enable Streaming Response Logic
-    # Requirement: Only is_final=true results are guaranteed to be complete, but we need interim_results for real-time
-    # Action: Ensure interim_results: True is enabled
     streaming_config = speech.StreamingRecognitionConfig(
         config=recognition_config,
-        interim_results=True  # CRITICAL: Enable interim results for real-time transcription
+        interim_results=True
     )
     
-    # Task 3: The Call - responses = await client.streaming_recognize(requests=request_generator())
+    # 3. 流式调用逻辑 (维度: 双向打通)
+    # 将请求生成器与响应处理逻辑结合:
     streaming_task = None
     
     if google_client.client:
         try:
-            # Start the async streaming recognition with AsyncRetry
-            streaming_task = asyncio.create_task(process_streaming_responses(websocket, session_data, audio_queue, streaming_config))
+            requests = request_generator(audio_queue, streaming_config)
+            responses = await google_client.client.streaming_recognize(
+                requests=requests, 
+                retry=retries.AsyncRetry()
+            )
+            # 直接处理响应循环
+            async def handle_responses():
+                async for response in responses:
+                    if not response.results:
+                        continue
+                    result = response.results[0]
+                    transcript = result.alternatives[0].transcript
+                    # 只要有字就打印并发送，实现实时效果
+                    print(f"DEBUG - 实时文字: {transcript} (Final: {result.is_final})")
+                    await websocket.send_json({"type": "transcript", "text": transcript, "is_final": result.is_final})
+            
+            streaming_task = asyncio.create_task(handle_responses())
         except Exception as e:
-            logger.error(f"❌ Failed to start streaming recognition: {e}")
+            print(f"DEBUG - 流连接故障: {e}")
     
     logger.info(f"🔌 WebSocket client connected: {client_id} (Session: {session_id})")
     
@@ -1012,31 +1025,21 @@ async def websocket_audio_stream(websocket: WebSocket):
                         continue
                 
                 if "bytes" in message:
-                    # 音频数据处理 - 添加缓冲和RMS音量检查
+                    # 直接发送原始音频数据到队列，让 request_generator 处理积压逻辑
                     audio_data = message["bytes"]
                     logger.debug(f"📨 Received {len(audio_data)} bytes from {client_id}")
                     
-                    # 数学清洗与Int16转换
+                    # 2. 确认RMS Volume：只要日志里维续出现 RMS Volume: 25000 左右的数字，就证明前端和转换逻辑没有任何问题，禁止改动音频采集部分
                     try:
                         float_data = np.frombuffer(audio_data, dtype=np.float32)
-                        clean_float = np.nan_to_num(float_data, nan=0.0)
-                        int16_data = (np.clip(clean_float, -1.0, 1.0) * 32767).astype(np.int16)
-                        
-                        # 2. 确认RMS Volume：只要日志里维续出现 RMS Volume: 25000 左右的数字，就证明前端和转换逻辑没有任何问题，禁止改动音频采集部分
-                        volume_rms = np.sqrt(np.mean(int16_data.astype(np.float32)**2))
+                        volume_rms = np.sqrt(np.mean(float_data.astype(np.float32)**2))
                         print(f"DEBUG - RMS Volume: {volume_rms}")
                         
-                        # 添加到缓冲区
-                        audio_buffer.extend(int16_data.tobytes())
-                        
-                        # 达到3200字节(100ms)后发送
-                        if len(audio_buffer) >= 3200:
-                            print(f"DEBUG - Sending 3200 bytes chunk")
-                            try:
-                                audio_queue.put_nowait(bytes(audio_buffer))
-                                audio_buffer.clear()
-                            except asyncio.QueueFull:
-                                logger.warning("⚠️ Audio processing queue full - dropping chunk")
+                        # 直接发送到队列，让 request_generator 处理 100ms 积压
+                        try:
+                            audio_queue.put_nowait(audio_data)
+                        except asyncio.QueueFull:
+                            logger.warning("⚠️ Audio processing queue full - dropping chunk")
                         
                     except Exception as e:
                         logger.error(f"❌ Audio processing error: {e}")
@@ -1090,38 +1093,7 @@ async def websocket_audio_stream(websocket: WebSocket):
             
             del active_sessions[session_id]
 
-async def process_streaming_responses(websocket: WebSocket, session_data: SessionData, audio_queue: asyncio.Queue, streaming_config):
-    """修正后的响应监听循环 (确保文字能打印并发出)"""
-    if not google_client.client:
-        logger.error("❌ Google Speech AsyncClient not initialized")
-        return
-    
-    try:
-        responses = await google_client.client.streaming_recognize(
-            requests=request_generator(audio_queue, streaming_config), 
-            retry=retries.AsyncRetry()
-        )
-        
-        async for response in responses:
-            if not response.results: 
-                continue
-            
-            # Action: You must iterate through the results list. If the API cannot recognize speech, the results field will be empty
-            for result in response.results:
-                if not result.alternatives:
-                    continue
-                    
-                transcript = result.alternatives[0].transcript
-                # 只要有字就打印并发送，不要管 is_final
-                print(f"DEBUG - 实时字幕: {transcript} (Final: {result.is_final})")
-                await websocket.send_json({
-                    "type": "transcript",
-                    "text": transcript,
-                    "is_final": result.is_final
-                })
-            
-    except Exception as e:
-        print(f"DEBUG - STT 流连接异常: {e}")
+# 4. 响应循环: async for response in responses: if not response.results: continue result = response.results[0] transcript = result.alternatives[0].transcript # 只要有字就打印并发送，实现实时效果 print(f"DEBUG - 实时文字: {transcript} (Final: {result.is_final})") await websocket.send_json({"type": "transcript", "text": transcript, "is_final": result.is_final})
 
 if __name__ == "__main__":
     # Production deployment - Railway uses Procfile, this is for local development only
