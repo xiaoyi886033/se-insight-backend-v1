@@ -1095,15 +1095,15 @@ async def websocket_audio_stream(websocket: WebSocket):
 async def process_streaming_responses(websocket: WebSocket, session_data: SessionData, audio_queue: asyncio.Queue, config):
     """Process streaming recognition responses using async generator pattern
     
-    Fix 2: Implement Proper Async Streaming - Refactor the call to: stream = await client.streaming_recognize(requests=request_generator(), retry=AsyncRetry())
+    正确的异步流式调用 (修复缺少参数的报错)
     """
     if not google_client.client:
         logger.error("❌ Google Speech AsyncClient not initialized")
         return
     
     try:
-        # Fix 2: Refactor the call to use AsyncRetry - stream = await client.streaming_recognize(requests=request_generator(), retry=AsyncRetry())
-        stream = await google_client.client.streaming_recognize(
+        # 正确的异步流式调用 - Fix missing parameters error
+        responses = await google_client.client.streaming_recognize(
             requests=request_generator(audio_queue, config), 
             retry=retries.AsyncRetry()
         )
@@ -1111,7 +1111,7 @@ async def process_streaming_responses(websocket: WebSocket, session_data: Sessio
         logger.info("✅ Async streaming recognition started with AsyncRetry")
         
         # Process streaming responses in real-time
-        async for response in stream:
+        async for response in responses:
             try:
                 # Process each streaming response
                 for result in response.results:
@@ -1121,7 +1121,7 @@ async def process_streaming_responses(websocket: WebSocket, session_data: Sessio
                         confidence = result.alternatives[0].confidence if result.alternatives[0].confidence else 0.0
                         current_time = time.time()
                         
-                        # Verification: We need the UserWarning to disappear and actual words to appear in "Raw Transcript"!
+                        # 白标标志: 部署后，日志中必须不再出现 SyntaxError，且必须出现类似 DEBUG - Sending 3200 bytes chunk 的信息
                         if transcript_text.strip():
                             print(f"DEBUG - Raw Transcript: '{transcript_text}' (final: {is_final})")
                             logger.info(f"📝 Google STT: \"{transcript_text}\" (final: {is_final})")
@@ -1181,8 +1181,8 @@ async def process_streaming_responses(websocket: WebSocket, session_data: Sessio
                 logger.error(f"❌ Streaming response processing error: {response_error}")
                 continue
                 
-    except Exception as streaming_error:
-        logger.error(f"❌ Async streaming recognition error: {streaming_error}")
+    except Exception as e:
+        logger.error(f"❌ STT API Connection Error: {e}")
 
 if __name__ == "__main__":
     # Production deployment - Railway uses Procfile, this is for local development only
