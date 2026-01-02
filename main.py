@@ -901,10 +901,16 @@ async def get_se_term_definition(term: str):
         "related_terms": term_def.related_terms
     }
 
-# Float32 → Int16 转换生成器 (带 Sanitization 防崩溃)
+# Google STT 标准对接方案 (Standard Implementation)
 async def request_generator(audio_queue, streaming_config):
-    """前端发送 Float32，Google 需要 Int16，必须转换"""
-    # 1. 发送配置
+    """
+    核心逻辑:
+    1. 输入: 浏览器给的 Float32 (每次 84 字节)
+    2. 动作: 必须乘以 32767 并转为 Int16 (Google 唯一能听懂的格式)
+    3. 输出: 积压到 3200 字节发给 Google
+    """
+    # 1. 第一帧：严格发送配置 (Standard Protocol)
+    # Google 要求第一次请求必须只包含配置
     yield speech.StreamingRecognizeRequest(streaming_config=streaming_config)
     
     chunk_buffer = bytearray()
@@ -915,21 +921,20 @@ async def request_generator(audio_queue, streaming_config):
             if data is None:
                 break
             
-            # 2. 必须恢复转换！(Float32 -> Int16)
-            # 解析前端发来的 84 字节 Float32 数据
+            # 2. 标准格式化 (Standard Normalization)
+            # 前端发来的是 84 字节的 Float32，必须解析
             float_data = np.frombuffer(data, dtype=np.float32)
             
-            # 3. 安全清洗 (防止之前的 nan 报错)
-            # 这一步至关重要：把任何坏数据变成静音
-            clean_float = np.nan_to_num(float_data, nan=0.0, posinf=0.0, neginf=0.0)
-            
-            # 4. 转换回 Google 能听懂的 Int16
+            # 3. 核心转换公式 (The Mandatory Conversion)
+            # 浏览器标准 (-1.0 到 1.0) -> Google 标准 (-32768 到 32767)
+            # 这里的 nan_to_num 是为了防止坏数据导致连接断开
+            clean_float = np.nan_to_num(float_data, nan=0.0)
             int16_data = (np.clip(clean_float, -1.0, 1.0) * 32767).astype(np.int16)
             
-            # 5. 入桶
+            # 4. 存入缓冲区
             chunk_buffer.extend(int16_data.tobytes())
             
-            # 6. 积压发送
+            # 5. 按照 Google 建议的 100ms (3200字节) 窗口发送
             if len(chunk_buffer) >= 3200:
                 yield speech.StreamingRecognizeRequest(audio_content=bytes(chunk_buffer))
                 chunk_buffer.clear()
