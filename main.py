@@ -901,57 +901,67 @@ async def get_se_term_definition(term: str):
         "related_terms": term_def.related_terms
     }
 
-# Google STT 标准对接方案 (Final Fix - WavAudioEncoder.js Logic)
+# TRACE MODE GENERATOR: Logs every step to find the silent failure
 async def request_generator(audio_queue, streaming_config):
-    """
-    The "Translator" Logic - Replicates WavAudioEncoder.js math: sample * 32767 with clipping
-    """
+    """TRACE MODE GENERATOR: Logs every step to find the silent failure.
+    Includes standard Float32 -> Int16 conversion."""
+    
+    print("DEBUG - [1] Generator: STARTING. Sending Config...")
+    
     # 1. Handshake: Send configuration first
     yield speech.StreamingRecognizeRequest(streaming_config=streaming_config)
     
+    print("DEBUG - [2] Generator: Config Sent. Entering Loop...")
+    
     chunk_buffer = bytearray()
     
-    # Low latency threshold: 640 bytes = approx 20ms of audio
-    # This ensures "Real-Time" feel, not "Buffered" feel.
-    BUFFER_THRESHOLD = 640
+    # Threshold: 320 bytes = ~10ms of audio (Int16) -> Instant response
+    # 84 bytes input (Float32) -> 42 bytes output (Int16)
+    # We need approx 8 packets to trigger a send.
+    BUFFER_THRESHOLD = 320
     
     while True:
         try:
-            data = await asyncio.wait_for(audio_queue.get(), timeout=1.0)
+            # Step 1: Wait for data
+            # print("DEBUG - [Loop] Waiting for queue...")
+            data = await audio_queue.get()
+            
             if data is None:
+                print("DEBUG - [End] Queue signal received. Exiting.")
                 break
             
-            # --- CORE FIX: Float32 to Int16 Conversion ---
-            
-            # A. Decode: The browser sends Float32 (84 bytes = 21 samples)
-            float_data = np.frombuffer(data, dtype=np.float32)
-            
-            # B. Sanitize: Prevent crashes from 'nan' values (Safety net)
-            float_data = np.nan_to_num(float_data, nan=0.0, posinf=0.0, neginf=0.0)
-            
-            # C. Clip: Prevent audio distortion/overflow (Standard logic)
-            # Matches logic: Math.max(-1, Math.min(1, input))
-            float_data = np.clip(float_data, -1.0, 1.0)
-            
-            # D. Quantize: Scale to Int16 range
-            # Matches logic: input * 32767
-            int16_data = (float_data * 32767).astype(np.int16)
-            
-            # ---------------------------------------------
-            
-            chunk_buffer.extend(int16_data.tobytes())
-            
-            # Send to Google as soon as we have a small playable chunk
-            if len(chunk_buffer) >= BUFFER_THRESHOLD:
-                yield speech.StreamingRecognizeRequest(audio_content=bytes(chunk_buffer))
-                chunk_buffer.clear()
+            # Step 2: Conversion (Float32 -> Int16)
+            # Browser sends Float32 (84 bytes), we convert to Int16 (42 bytes)
+            try:
+                float_data = np.frombuffer(data, dtype=np.float32)
                 
-        except asyncio.TimeoutError:
-            # Flush remaining data on timeout
-            if len(chunk_buffer) > 0:
-                yield speech.StreamingRecognizeRequest(audio_content=bytes(chunk_buffer))
-                chunk_buffer.clear()
-            continue
+                # Sanitize (Prevent NaN crashes)
+                if not np.all(np.isfinite(float_data)):
+                    print("DEBUG - [Warn] NaN/Inf detected, sanitizing...")
+                    float_data = np.nan_to_num(float_data, nan=0.0, posinf=0.0, neginf=0.0)
+                
+                # Clip & Scale
+                float_data = np.clip(float_data, -1.0, 1.0)
+                int16_data = (float_data * 32767).astype(np.int16)
+                
+                # Step 3: Buffer
+                chunk_buffer.extend(int16_data.tobytes())
+                
+                # Trace log to prove we are alive (Only print every ~10 packets to avoid spam, or print all for now)
+                # print(f"DEBUG - [3] Buffered. Size: {len(chunk_buffer)} / {BUFFER_THRESHOLD}")
+                
+                # Step 4: Send if full
+                if len(chunk_buffer) >= BUFFER_THRESHOLD:
+                    print(f"DEBUG - [4] 🚀 SENDING {len(chunk_buffer)} bytes to Google!")
+                    yield speech.StreamingRecognizeRequest(audio_content=bytes(chunk_buffer))
+                    chunk_buffer.clear()
+                    
+            except Exception as e:
+                print(f"ERROR - Conversion/Buffer failed: {e}")
+                
+        except Exception as e:
+            print(f"ERROR - Queue/Loop failed: {e}")
+            break
 
 @app.websocket("/ws/audio")
 async def websocket_audio_stream(websocket: WebSocket):
