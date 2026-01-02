@@ -904,7 +904,7 @@ async def get_se_term_definition(term: str):
 # Float32 → Int16 转换生成器 (带 Sanitization 防崩溃)
 async def request_generator(audio_queue, streaming_config):
     """前端发送 Float32，Google 需要 Int16，必须转换"""
-    # 1. 发送配置 (Config)
+    # 1. 发送配置
     yield speech.StreamingRecognizeRequest(streaming_config=streaming_config)
     
     chunk_buffer = bytearray()
@@ -915,31 +915,28 @@ async def request_generator(audio_queue, streaming_config):
             if data is None:
                 break
             
-            # 2. 转换逻辑 (Float32 -> Int16) 
-            # 使用 numpy 解析 Float32 数据
+            # 2. 必须恢复转换！(Float32 -> Int16)
+            # 解析前端发来的 84 字节 Float32 数据
             float_data = np.frombuffer(data, dtype=np.float32)
             
-            # 3. 数据清洗 (Sanitization) - 解决 nan/inf 问题
-            # 将坏死数据(nan)变0，将无穷大(inf)变最大值
-            clean_float = np.nan_to_num(float_data, nan=0.0, posinf=1.0, neginf=-1.0)
+            # 3. 安全清洗 (防止之前的 nan 报错)
+            # 这一步至关重要：把任何坏数据变成静音
+            clean_float = np.nan_to_num(float_data, nan=0.0, posinf=0.0, neginf=0.0)
             
-            # 4. 安全转换
-            # 限制在 -1.0 到 1.0 之间，然后转 Int16
+            # 4. 转换回 Google 能听懂的 Int16
             int16_data = (np.clip(clean_float, -1.0, 1.0) * 32767).astype(np.int16)
             
-            # 5. 入桶积压
+            # 5. 入桶
             chunk_buffer.extend(int16_data.tobytes())
             
-            # 6. 积压到 3200 字节 (100ms) 再发
+            # 6. 积压发送
             if len(chunk_buffer) >= 3200:
-                print(f"DEBUG - Sending {len(chunk_buffer)} bytes to Google STT")
                 yield speech.StreamingRecognizeRequest(audio_content=bytes(chunk_buffer))
                 chunk_buffer.clear()
                 
         except asyncio.TimeoutError:
             # 超时但有残余数据，也发送出去
             if len(chunk_buffer) > 0:
-                print(f"DEBUG - Timeout, flushing {len(chunk_buffer)} bytes")
                 yield speech.StreamingRecognizeRequest(audio_content=bytes(chunk_buffer))
                 chunk_buffer.clear()
             continue
