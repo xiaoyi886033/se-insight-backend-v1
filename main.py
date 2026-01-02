@@ -13,6 +13,7 @@ import base64
 import tempfile
 import smtplib
 import aiohttp
+import numpy as np
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from datetime import datetime
@@ -900,9 +901,9 @@ async def get_se_term_definition(term: str):
         "related_terms": term_def.related_terms
     }
 
-# 极简 Pass-Through 生成器 - 前端已发送 Int16，不做任何转换
+# Float32 → Int16 转换生成器 (带 Sanitization 防崩溃)
 async def request_generator(audio_queue, streaming_config):
-    """极简积压与转发 - 收满 3200 字节 (100ms) 原样发给 Google"""
+    """前端发送 Float32，Google 需要 Int16，必须转换"""
     # 1. 发送配置 (Config)
     yield speech.StreamingRecognizeRequest(streaming_config=streaming_config)
     
@@ -914,10 +915,22 @@ async def request_generator(audio_queue, streaming_config):
             if data is None:
                 break
             
-            # 2. 直接拼接，不做任何转换！(Data is already valid Int16)
-            chunk_buffer.extend(data)
+            # 2. 转换逻辑 (Float32 -> Int16) 
+            # 使用 numpy 解析 Float32 数据
+            float_data = np.frombuffer(data, dtype=np.float32)
             
-            # 3. 积压到 100ms (3200 bytes) 就发送
+            # 3. 数据清洗 (Sanitization) - 解决 nan/inf 问题
+            # 将坏死数据(nan)变0，将无穷大(inf)变最大值
+            clean_float = np.nan_to_num(float_data, nan=0.0, posinf=1.0, neginf=-1.0)
+            
+            # 4. 安全转换
+            # 限制在 -1.0 到 1.0 之间，然后转 Int16
+            int16_data = (np.clip(clean_float, -1.0, 1.0) * 32767).astype(np.int16)
+            
+            # 5. 入桶积压
+            chunk_buffer.extend(int16_data.tobytes())
+            
+            # 6. 积压到 3200 字节 (100ms) 再发
             if len(chunk_buffer) >= 3200:
                 print(f"DEBUG - Sending {len(chunk_buffer)} bytes to Google STT")
                 yield speech.StreamingRecognizeRequest(audio_content=bytes(chunk_buffer))
