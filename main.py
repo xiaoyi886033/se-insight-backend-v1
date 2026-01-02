@@ -13,7 +13,6 @@ import base64
 import tempfile
 import smtplib
 import aiohttp
-import numpy as np  # Task 1: Environment Fix - Add import numpy as np at the top (non-negotiable)
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from datetime import datetime
@@ -901,56 +900,35 @@ async def get_se_term_definition(term: str):
         "related_terms": term_def.related_terms
     }
 
-# 3. 带有 100ms 积压逻辑的生成器: async def request_generator(audio_queue): yield speech.StreamingRecognizeRequest(streaming_config=streaming_config) 
+# 极简 Pass-Through 生成器 - 前端已发送 Int16，不做任何转换
 async def request_generator(audio_queue, streaming_config):
+    """极简积压与转发 - 收满 3200 字节 (100ms) 原样发给 Google"""
+    # 1. 发送配置 (Config)
     yield speech.StreamingRecognizeRequest(streaming_config=streaming_config)
-    local_buffer = bytearray()
-    last_data_time = time.time()
+    
+    chunk_buffer = bytearray()
     
     while True:
         try:
-            # 步骤2: 添加1秒超时检测
             data = await asyncio.wait_for(audio_queue.get(), timeout=1.0)
             if data is None:
                 break
             
-            last_data_time = time.time()
+            # 2. 直接拼接，不做任何转换！(Data is already valid Int16)
+            chunk_buffer.extend(data)
             
-            # 步骤2: CRITICAL FIX - 添加清洁过滤器处理音频信号
-            # 第一步：数据清洗 (The Filter)
-            # 必须先执行 nan_to_num，防止乘法运算使数据崩溃
-            float_data = np.frombuffer(data, dtype=np.float32)
-            clean_float = np.nan_to_num(float_data, nan=0.0, posinf=1.0, neginf=-1.0)
-            
-            # 第二步：幅度剪裁 (Safety Clip)
-            # 确保数据严格在 -1.0 到 1.0 之间
-            clipped_float = np.clip(clean_float, -1.0, 1.0)
-            
-            # 第三步：量化转换 (Quantization)
-            # 现在的转换将是 100% 安全且物理有效的
-            int16_data = (clipped_float * 32767).astype(np.int16)
-            
-            # 第四步：计算 RMS 音量进行验证
-            # 只要这个值在 10000 到 30000 之间且不是 nan，就一定有声音
-            rms_val = np.sqrt(np.mean(int16_data.astype(np.float32)**2))
-            print(f"DEBUG - 清洗后音量: {rms_val}")
-            
-            # 步骤2: 验证转换结果
-            print(f"DEBUG - Data conversion: {len(float_data)} float32 → {len(int16_data)} int16")
-            
-            local_buffer.extend(int16_data.tobytes())
-            
-            # 恢复 3200 字节 (100ms) 缓冲区 - 移除测试用的1600字节
-            if len(local_buffer) >= 3200:
-                print(f"DEBUG - Sending 3200 bytes")
-                yield speech.StreamingRecognizeRequest(audio_content=bytes(local_buffer))
-                local_buffer.clear()
+            # 3. 积压到 100ms (3200 bytes) 就发送
+            if len(chunk_buffer) >= 3200:
+                print(f"DEBUG - Sending {len(chunk_buffer)} bytes to Google STT")
+                yield speech.StreamingRecognizeRequest(audio_content=bytes(chunk_buffer))
+                chunk_buffer.clear()
                 
         except asyncio.TimeoutError:
-            # 步骤2: 超时检测
-            print("DEBUG - Audio stream timed out")
-            if time.time() - last_data_time > 1.0:
-                print("DEBUG - No audio data received for 1 second")
+            # 超时但有残余数据，也发送出去
+            if len(chunk_buffer) > 0:
+                print(f"DEBUG - Timeout, flushing {len(chunk_buffer)} bytes")
+                yield speech.StreamingRecognizeRequest(audio_content=bytes(chunk_buffer))
+                chunk_buffer.clear()
             continue
 
 @app.websocket("/ws/audio")
@@ -1067,25 +1045,15 @@ async def websocket_audio_stream(websocket: WebSocket):
                         continue
                 
                 if "bytes" in message:
-                    # 直接发送原始音频数据到队列，让 request_generator 处理积压逻辑
+                    # 直接发送原始音频数据到队列 - 前端已发送 Int16，不做任何转换
                     audio_data = message["bytes"]
-                    logger.debug(f"📨 Received {len(audio_data)} bytes from {client_id}")
+                    print(f"DEBUG - Received {len(audio_data)} bytes from {client_id}")
                     
-                    # 2. 确认RMS Volume：只要日志里维续出现 RMS Volume: 25000 左右的数字，就证明前端和转换逻辑没有任何问题，禁止改动音频采集部分
+                    # 直接发送到队列，让 request_generator 处理 100ms 积压
                     try:
-                        float_data = np.frombuffer(audio_data, dtype=np.float32)
-                        volume_rms = np.sqrt(np.mean(float_data.astype(np.float32)**2))
-                        print(f"DEBUG - RMS Volume: {volume_rms}")
-                        
-                        # 直接发送到队列，让 request_generator 处理 100ms 积压
-                        try:
-                            audio_queue.put_nowait(audio_data)
-                        except asyncio.QueueFull:
-                            logger.warning("⚠️ Audio processing queue full - dropping chunk")
-                        
-                    except Exception as e:
-                        logger.error(f"❌ Audio processing error: {e}")
-                        continue
+                        audio_queue.put_nowait(audio_data)
+                    except asyncio.QueueFull:
+                        logger.warning("⚠️ Audio processing queue full - dropping chunk")
                     
     except WebSocketDisconnect:
         logger.info(f"🔌 WebSocket client disconnected: {client_id}")
