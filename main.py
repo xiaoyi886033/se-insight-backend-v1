@@ -901,18 +901,19 @@ async def get_se_term_definition(term: str):
         "related_terms": term_def.related_terms
     }
 
-# Google STT 标准对接方案 (Industry Standard Fix)
+# Google STT 标准对接方案 (Final Fix - WavAudioEncoder.js Logic)
 async def request_generator(audio_queue, streaming_config):
     """
-    核心逻辑:
-    1. 输入: 浏览器给的 Float32 (每次 84 字节 = 21 个点)
-    2. 动作: 必须乘以 32767 并转为 Int16 (Google 唯一能听懂的格式)
-    3. 输出: 积压到 320 字节就发给 Google (快速响应)
+    The "Translator" Logic - Replicates WavAudioEncoder.js math: sample * 32767 with clipping
     """
-    # 1. 发送配置
+    # 1. Handshake: Send configuration first
     yield speech.StreamingRecognizeRequest(streaming_config=streaming_config)
     
     chunk_buffer = bytearray()
+    
+    # Low latency threshold: 640 bytes = approx 20ms of audio
+    # This ensures "Real-Time" feel, not "Buffered" feel.
+    BUFFER_THRESHOLD = 640
     
     while True:
         try:
@@ -920,26 +921,33 @@ async def request_generator(audio_queue, streaming_config):
             if data is None:
                 break
             
-            # 2. 转换 (Float32 -> Int16)
-            float_data = np.frombuffer(data, dtype=np.float32)
-            clean_float = np.nan_to_num(float_data, nan=0.0)
-            int16_data = (np.clip(clean_float, -1.0, 1.0) * 32767).astype(np.int16)
+            # --- CORE FIX: Float32 to Int16 Conversion ---
             
-            # 3. 入桶
+            # A. Decode: The browser sends Float32 (84 bytes = 21 samples)
+            float_data = np.frombuffer(data, dtype=np.float32)
+            
+            # B. Sanitize: Prevent crashes from 'nan' values (Safety net)
+            float_data = np.nan_to_num(float_data, nan=0.0, posinf=0.0, neginf=0.0)
+            
+            # C. Clip: Prevent audio distortion/overflow (Standard logic)
+            # Matches logic: Math.max(-1, Math.min(1, input))
+            float_data = np.clip(float_data, -1.0, 1.0)
+            
+            # D. Quantize: Scale to Int16 range
+            # Matches logic: input * 32767
+            int16_data = (float_data * 32767).astype(np.int16)
+            
+            # ---------------------------------------------
+            
             chunk_buffer.extend(int16_data.tobytes())
             
-            # -------------------------------------------------------
-            # ！！！核心修改：把 3200 改成 320 ！！！
-            # 这样只要收到 ~8 个包就会立即发给 Google，字幕会秒出
-            # -------------------------------------------------------
-            if len(chunk_buffer) >= 320:
-                # 打印日志证明我们在发货
-                print(f"DEBUG - 积压满，发送 {len(chunk_buffer)} 字节给 Google...")
+            # Send to Google as soon as we have a small playable chunk
+            if len(chunk_buffer) >= BUFFER_THRESHOLD:
                 yield speech.StreamingRecognizeRequest(audio_content=bytes(chunk_buffer))
                 chunk_buffer.clear()
                 
         except asyncio.TimeoutError:
-            # 超时但有残余数据，也发送出去
+            # Flush remaining data on timeout
             if len(chunk_buffer) > 0:
                 yield speech.StreamingRecognizeRequest(audio_content=bytes(chunk_buffer))
                 chunk_buffer.clear()
@@ -975,27 +983,18 @@ async def websocket_audio_stream(websocket: WebSocket):
     # Dynamic audio configuration from client
     client_sample_rate = 16000  # Default, will be updated from start_session
     
-    # 步骤3: 对齐 Google 官方规范 (API Config)
-    # Requirement: RecognitionConfig must be the FIRST message
-    # Action: Set language_code="en-US", encoding="LINEAR16", sample_rate_hertz=16000
-    # Action: Ensure interim_results=True is enabled in the config
-    
+    # Google STT Configuration (Ensure LINEAR16 for Int16 audio)
     recognition_config = speech.RecognitionConfig(
-        encoding=speech.RecognitionConfig.AudioEncoding.LINEAR16, 
+        encoding=speech.RecognitionConfig.AudioEncoding.LINEAR16,  # Must be Int16
         sample_rate_hertz=16000,
-        language_code="en-US", 
-        model="latest_long", 
-        enable_automatic_punctuation=True
+        language_code="en-US",  # Change to "zh-CN" if testing Chinese
+        model="latest_long",
     )
     
     streaming_config = speech.StreamingRecognitionConfig(
         config=recognition_config,
         interim_results=True
     )
-    
-    # 步骤3: Log Requirement - 验证配置
-    print(f"DEBUG - Google STT Config: language={recognition_config.language_code}, encoding={recognition_config.encoding}, rate={recognition_config.sample_rate_hertz}")
-    print(f"DEBUG - Streaming Config: interim_results={streaming_config.interim_results}")
     
     # 3. 流式调用逻辑 (维度: 双向打通)
     # 将请求生成器与响应处理逻辑结合:
