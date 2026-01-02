@@ -901,16 +901,15 @@ async def get_se_term_definition(term: str):
         "related_terms": term_def.related_terms
     }
 
-# Google STT 标准对接方案 (Standard Implementation)
+# Google STT 标准对接方案 (Industry Standard Fix)
 async def request_generator(audio_queue, streaming_config):
     """
     核心逻辑:
-    1. 输入: 浏览器给的 Float32 (每次 84 字节)
+    1. 输入: 浏览器给的 Float32 (每次 84 字节 = 21 个点)
     2. 动作: 必须乘以 32767 并转为 Int16 (Google 唯一能听懂的格式)
     3. 输出: 积压到 3200 字节发给 Google
     """
-    # 1. 第一帧：严格发送配置 (Standard Protocol)
-    # Google 要求第一次请求必须只包含配置
+    # 1. 握手阶段：仅发送配置 (符合 Google 协议)
     yield speech.StreamingRecognizeRequest(streaming_config=streaming_config)
     
     chunk_buffer = bytearray()
@@ -921,21 +920,25 @@ async def request_generator(audio_queue, streaming_config):
             if data is None:
                 break
             
-            # 2. 标准格式化 (Standard Normalization)
-            # 前端发来的是 84 字节的 Float32，必须解析
+            # --- 核心修复区 (The Industry Standard Fix) ---
+            
+            # A. 接收：前端发来的是 Float32 (84 字节 = 21 个点)
             float_data = np.frombuffer(data, dtype=np.float32)
             
-            # 3. 核心转换公式 (The Mandatory Conversion)
-            # 浏览器标准 (-1.0 到 1.0) -> Google 标准 (-32768 到 32767)
-            # 这里的 nan_to_num 是为了防止坏数据导致连接断开
-            clean_float = np.nan_to_num(float_data, nan=0.0)
+            # B. 清洗：成功的项目都会防一手 NaN (空值)
+            # 这就是为什么别人不报错的原因：把坏值变成了 0 (静音)
+            clean_float = np.nan_to_num(float_data, nan=0.0, posinf=0.0, neginf=0.0)
+            
+            # C. 转码：将浏览器标准 (-1.0 to 1.0) 映射到 Google 标准 (-32768 to 32767)
+            # 必须先 clip 限制范围，防止爆音
             int16_data = (np.clip(clean_float, -1.0, 1.0) * 32767).astype(np.int16)
             
-            # 4. 存入缓冲区
+            # D. 积压：Google 建议 100ms 的包 (3200 字节)
+            # 你的 84 字节太碎了，必须攒一攒
             chunk_buffer.extend(int16_data.tobytes())
             
-            # 5. 按照 Google 建议的 100ms (3200字节) 窗口发送
             if len(chunk_buffer) >= 3200:
+                # 发送标准 Int16 包
                 yield speech.StreamingRecognizeRequest(audio_content=bytes(chunk_buffer))
                 chunk_buffer.clear()
                 
