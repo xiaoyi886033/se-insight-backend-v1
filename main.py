@@ -965,166 +965,92 @@ async def request_generator(audio_queue, streaming_config):
 
 @app.websocket("/ws/audio")
 async def websocket_audio_stream(websocket: WebSocket):
-    """WebSocket endpoint for real-time audio streaming
-    
-    Task 3: Implements async generator pattern with speech_v1.SpeechAsyncClient
-    Task 4: Session Persistence - Keep ONE stream alive per WebSocket, enable interim_results=True
-    """
+    """WebSocket endpoint with LAZY Google Stream initialization (Sample Rate Fix)"""
     await websocket.accept()
     client_id = f"client_{int(time.time() * 1000)}"
-    session_id = f"session_{client_id}"
+    logger.info(f"🔌 Connected: {client_id}")
     
-    # Initialize session data for archival
-    session_data = SessionData(
-        session_id=session_id,
-        start_time=datetime.now()
-    )
-    active_sessions[session_id] = session_data
-    
-    # Audio buffering for Gemini API rate limiting only
-    buffer_size_threshold = 32000  # ~2 seconds of 16kHz mono audio (for Gemini)
-    
-    # Task 3: Use asyncio.Queue for async generator pattern
     audio_queue = asyncio.Queue()
-    
-    last_gemini_call = 0
-    gemini_interval = 2.0  # Minimum 2 seconds between Gemini calls
-    
-    # Dynamic audio configuration from client
-    client_sample_rate = 16000  # Default, will be updated from start_session
-    
-    # Google STT Configuration (Ensure LINEAR16 for Int16 audio)
-    recognition_config = speech.RecognitionConfig(
-        encoding=speech.RecognitionConfig.AudioEncoding.LINEAR16,  # Must be Int16
-        sample_rate_hertz=16000,
-        language_code="en-US",  # Change to "zh-CN" if testing Chinese
-        model="latest_long",
-    )
-    
-    streaming_config = speech.StreamingRecognitionConfig(
-        config=recognition_config,
-        interim_results=True
-    )
-    
-    # 3. 流式调用逻辑 (维度: 双向打通)
-    # 将请求生成器与响应处理逻辑结合:
+    stream_active = False
     streaming_task = None
     
-    if google_client.client:
-        try:
-            requests = request_generator(audio_queue, streaming_config)
-            responses = await google_client.client.streaming_recognize(
-                requests=requests, 
-                retry=retries.AsyncRetry()
-            )
-            # 直接处理响应循环
-            async def handle_responses():
+    # Initialization Helper
+    async def start_google_stream(sample_rate):
+        nonlocal stream_active, streaming_task
+        print(f"DEBUG - 🟢 Starting Google Stream at {sample_rate}Hz...")
+        
+        # 1. Config with CORRECT Sample Rate
+        config = speech.RecognitionConfig(
+            encoding=speech.RecognitionConfig.AudioEncoding.LINEAR16,
+            sample_rate_hertz=sample_rate,
+            language_code="en-US",
+            model="latest_long",
+        )
+        streaming_config = speech.StreamingRecognitionConfig(config=config, interim_results=True)
+        
+        # 2. Start Generator & API Call
+        requests = request_generator(audio_queue, streaming_config)
+        responses = await google_client.client.streaming_recognize(
+            requests=requests, 
+            retry=retries.AsyncRetry()
+        )
+        
+        # 3. Response Loop
+        async def response_loop():
+            print("DEBUG - 👂 Listening for Google Responses...")
+            try:
                 async for response in responses:
-                    if not response.results:
+                    if not response.results: 
                         continue
                     result = response.results[0]
                     transcript = result.alternatives[0].transcript
-                    # 只要有字就打印并发送，实现实时效果
-                    print(f"DEBUG - 实时文字: {transcript} (Final: {result.is_final})")
-                    await websocket.send_json({"type": "transcript", "text": transcript, "is_final": result.is_final})
-            
-            streaming_task = asyncio.create_task(handle_responses())
-        except Exception as e:
-            print(f"DEBUG - 流连接故障: {e}")
-    
-    logger.info(f"🔌 WebSocket client connected: {client_id} (Session: {session_id})")
+                    print(f"DEBUG - 🗣️ SUBTITLE: {transcript}")
+                    await websocket.send_json({
+                        "type": "transcript",
+                        "text": transcript,
+                        "is_final": result.is_final
+                    })
+            except Exception as e:
+                print(f"🔥 Google Stream Error: {e}")
+        
+        streaming_task = asyncio.create_task(response_loop())
+        stream_active = True
     
     try:
         while True:
-            # Receive message from extension
+            # Wait for message
             message = await websocket.receive()
             
-            if message["type"] == "websocket.receive":
-                # Handle JSON messages (start_session, etc.)
-                if "text" in message:
-                    try:
-                        json_message = json.loads(message["text"])
-                        if json_message.get("type") == "start_session":
-                            # Extract client audio configuration
-                            config_data = json_message.get("config", {})
-                            client_sample_rate = config_data.get("sampleRate", 16000)
-                            logger.info(f"🎵 Client audio config - Sample Rate: {client_sample_rate}Hz")
-                            
-                            # Send acknowledgment
-                            await websocket.send_text(json.dumps({
-                                "type": "session_started",
-                                "session_id": session_id,
-                                "server_config": {
-                                    "sample_rate": client_sample_rate,
-                                    "encoding": "LINEAR16"
-                                }
-                            }))
-                            continue
-                        elif json_message.get("type") == "audio_config":
-                            logger.info(f"🔧 Audio config: {json_message.get('config')}")
-                            continue
-                    except json.JSONDecodeError:
-                        logger.warning(f"⚠️ Invalid JSON from {client_id}")
-                        continue
+            # Case A: Config Message (Start Session)
+            if message["type"] == "websocket.receive" and "text" in message:
+                try:
+                    data = json.loads(message["text"])
+                    if data.get("type") == "start_session":
+                        # Get rate from frontend, Default to 48000 (Browser Standard) if missing
+                        rate = data.get("config", {}).get("sampleRate", 48000)
+                        if not stream_active:
+                            await start_google_stream(rate)
+                except:
+                    pass
+            
+            # Case B: Audio Data (Bytes)
+            if "bytes" in message:
+                audio_data = message["bytes"]
                 
-                if "bytes" in message:
-                    # 直接发送原始音频数据到队列 - 前端已发送 Int16，不做任何转换
-                    audio_data = message["bytes"]
-                    print(f"DEBUG - Received {len(audio_data)} bytes from {client_id}")
-                    
-                    # 直接发送到队列，让 request_generator 处理 100ms 积压
-                    try:
-                        audio_queue.put_nowait(audio_data)
-                    except asyncio.QueueFull:
-                        logger.warning("⚠️ Audio processing queue full - dropping chunk")
-                    
-    except WebSocketDisconnect:
-        logger.info(f"🔌 WebSocket client disconnected: {client_id}")
-        
-        # Stop streaming task
-        if streaming_task:
-            # Send shutdown signal to audio queue
-            try:
-                audio_queue.put_nowait(None)
-            except:
-                pass
-            streaming_task.cancel()
-        
-        # Finalize session data and send archive
-        session_data.end_time = datetime.now()
-        session_data.total_duration = (session_data.end_time - session_data.start_time).total_seconds()
-        
-        # Send email archive asynchronously
-        if email_service.is_configured and session_data.transcripts:
-            asyncio.create_task(email_service.send_session_archive(session_data))
-        
-        # Clean up session
-        if session_id in active_sessions:
-            del active_sessions[session_id]
-            
+                # Lazy Start: If bytes arrive before config, assume 48000Hz (Safe Bet)
+                if not stream_active:
+                    print("DEBUG - ⚠️ Audio received before config. Defaulting to 48000Hz.")
+                    await start_google_stream(48000)
+                
+                # Push to queue
+                await audio_queue.put(audio_data)
+                
     except Exception as e:
-        logger.error(f"❌ WebSocket error for {client_id}: {e}")
-        
-        # Stop streaming task
+        logger.error(f"❌ Connection closed: {e}")
+    finally:
+        await audio_queue.put(None)
         if streaming_task:
-            # Send shutdown signal to audio queue
-            try:
-                audio_queue.put_nowait(None)
-            except:
-                pass
             streaming_task.cancel()
-        
-        # Clean up session on error
-        if session_id in active_sessions:
-            session_data = active_sessions[session_id]
-            session_data.end_time = datetime.now()
-            session_data.total_duration = (session_data.end_time - session_data.start_time).total_seconds()
-            
-            # Still try to send archive on error
-            if email_service.is_configured and session_data.transcripts:
-                asyncio.create_task(email_service.send_session_archive(session_data))
-            
-            del active_sessions[session_id]
 
 # 4. 响应循环: async for response in responses: if not response.results: continue result = response.results[0] transcript = result.alternatives[0].transcript # 只要有字就打印并发送，实现实时效果 print(f"DEBUG - 实时文字: {transcript} (Final: {result.is_final})") await websocket.send_json({"type": "transcript", "text": transcript, "is_final": result.is_final})
 
