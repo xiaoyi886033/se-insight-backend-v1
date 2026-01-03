@@ -901,36 +901,45 @@ async def get_se_term_definition(term: str):
         "related_terms": term_def.related_terms
     }
 
-# PASS-THROUGH MODE: Input is ALREADY Int16. Do not convert.
-async def request_generator(audio_queue, streaming_config):
-    """PASS-THROUGH MODE: Input is ALREADY Int16. Do not convert."""
-    print("DEBUG - [1] Generator: Sending Config...")
+# Phase 2: Smart Buffering with Dynamic Threshold (Google's 100ms standard)
+async def request_generator(audio_queue, streaming_config, sample_rate: int, channels: int):
+    """
+    Production request generator with dynamic 100ms buffering.
+    
+    Args:
+        audio_queue: Queue containing Int16 audio chunks
+        streaming_config: Google Speech streaming configuration
+        sample_rate: Frontend-provided sample rate (e.g., 44100, 48000)
+        channels: Frontend-provided channel count (usually 2 for stereo)
+    """
+    print(f"DEBUG - [1] Generator: Sending Config (rate={sample_rate}, channels={channels})...")
     yield speech.StreamingRecognizeRequest(streaming_config=streaming_config)
     
     print("DEBUG - [2] Generator: Ready for Int16 audio...")
     
     chunk_buffer = bytearray()
-    BUFFER_THRESHOLD = 1600  # 50ms at 16kHz, or ~16ms at 48kHz
+    # Phase 2: Dynamic threshold = sample_rate * channels * 2 (bytes/sample) * 0.1 (100ms)
+    # This ensures exactly 100ms chunks regardless of sample rate
+    BUFFER_THRESHOLD = int(sample_rate * channels * 2 * 0.1)
+    print(f"DEBUG - [3] Dynamic buffer threshold: {BUFFER_THRESHOLD} bytes (100ms at {sample_rate}Hz, {channels}ch)")
     
     while True:
         try:
-            # Step 1: Get Raw Bytes (Already Int16)
             data = await asyncio.wait_for(audio_queue.get(), timeout=1.0)
             if data is None:
                 print("DEBUG - [End] Queue closed.")
                 break
             
-            # Step 2: NO CONVERSION. Just Buffer.
-            # We assume data is already Linear16 PCM.
+            # Pass-through: Input is already Int16 Linear PCM
             chunk_buffer.extend(data)
             
-            # Step 3: Send
+            # Send when we have 100ms worth of audio
             if len(chunk_buffer) >= BUFFER_THRESHOLD:
-                # print(f"DEBUG - 🚀 PUSHING {len(chunk_buffer)} bytes (Int16) to Google")
                 yield speech.StreamingRecognizeRequest(audio_content=bytes(chunk_buffer))
                 chunk_buffer.clear()
                 
         except asyncio.TimeoutError:
+            # Flush remaining buffer on timeout
             if len(chunk_buffer) > 0:
                 yield speech.StreamingRecognizeRequest(audio_content=bytes(chunk_buffer))
                 chunk_buffer.clear()
@@ -938,35 +947,80 @@ async def request_generator(audio_queue, streaming_config):
 
 @app.websocket("/ws/audio")
 async def websocket_audio_stream(websocket: WebSocket):
-    """WebSocket endpoint with LAZY Google Stream initialization and Int16 pass-through"""
+    """
+    Production WebSocket endpoint with strict handshake protocol.
+    
+    Phase 1: Strict Handshake - Config MUST arrive before audio
+    Phase 2: Google Standard Configuration - Use frontend-provided rate/channels
+    Phase 3: Intelligence Integration - SE Knowledge Base + Gemini in response loop
+    """
     await websocket.accept()
     client_id = f"client_{int(time.time() * 1000)}"
     logger.info(f"🔌 Client Connected: {client_id}")
     
+    # Phase 1: State variables - NO hardcoded defaults
     audio_queue = asyncio.Queue()
     stream_task = None
     stream_started = False
+    config_received = False  # Phase 1: Track if config has been received
     
-    async def start_recognition(sample_rate):
-        nonlocal stream_task, stream_started
-        print(f"DEBUG - 🟢 Initializing Google Stream at {sample_rate}Hz (Linear16)")
+    # Phase 1: Frontend-provided configuration (no defaults until config arrives)
+    frontend_sample_rate = None
+    frontend_channels = None
+    
+    # Session tracking for archival
+    session_data = SessionData(
+        session_id=client_id,
+        start_time=datetime.now()
+    )
+    active_sessions[client_id] = session_data
+    
+    async def start_recognition(sample_rate: int, channels: int):
+        """
+        Phase 2: Initialize Google Stream with frontend-provided configuration.
         
-        # Configure for Int16 (LINEAR16) at dynamic rate
+        Args:
+            sample_rate: Exact rate from frontend (e.g., 44100, 48000)
+            channels: Exact channel count from frontend (usually 2 for stereo)
+        """
+        nonlocal stream_task, stream_started
+        print(f"DEBUG - 🟢 Initializing Google Stream at {sample_rate}Hz, {channels}ch (Linear16)")
+        
+        # Phase 2: Correct Config - Use frontend-provided values
         config = speech.RecognitionConfig(
             encoding=speech.RecognitionConfig.AudioEncoding.LINEAR16,
             sample_rate_hertz=sample_rate,
-            language_code="en-US",  # Change to zh-CN if needed
+            audio_channel_count=channels,  # Phase 2: CRITICAL - Set to frontend_provided_channels
+            language_code="en-US",
             model="latest_long",
+            enable_automatic_punctuation=True,  # Phase 2: Enable punctuation
+            speech_contexts=[
+                speech.SpeechContext(
+                    phrases=[
+                        # SE terminology for better recognition
+                        "software engineering", "API", "microservices", "database",
+                        "architecture", "design pattern", "inheritance", "polymorphism",
+                        "asynchronous", "synchronous", "REST", "GraphQL", "Docker",
+                        "Kubernetes", "DevOps", "continuous integration", "deployment",
+                        "object oriented", "functional programming", "data structure",
+                        "algorithm", "framework", "library", "interface", "abstraction"
+                    ]
+                )
+            ]
         )
         streaming_config = speech.StreamingRecognitionConfig(config=config, interim_results=True)
         
-        requests = request_generator(audio_queue, streaming_config)
+        # Phase 2: Pass sample_rate and channels to request_generator for dynamic buffering
+        requests = request_generator(audio_queue, streaming_config, sample_rate, channels)
         responses = await google_client.client.streaming_recognize(
             requests=requests, 
             retry=retries.AsyncRetry()
         )
         
         async def listen_to_google():
+            """
+            Phase 3: Response loop with SE Knowledge Base and Gemini integration.
+            """
             print("DEBUG - 👂 Listening for subtitles...")
             try:
                 async for response in responses:
@@ -974,51 +1028,149 @@ async def websocket_audio_stream(websocket: WebSocket):
                         continue
                     result = response.results[0]
                     transcript = result.alternatives[0].transcript
-                    print(f"DEBUG - 📝 Subtitle: {transcript}")
-                    await websocket.send_json({
+                    is_final = result.is_final
+                    
+                    print(f"DEBUG - 📝 Subtitle: {transcript} (Final: {is_final})")
+                    
+                    # Phase 3: Construct Rich Response
+                    response_payload = {
                         "type": "transcript",
                         "text": transcript,
-                        "is_final": result.is_final
-                    })
+                        "is_final": is_final
+                    }
+                    
+                    # Phase 3: Level 1 (Local) - SE term detection on final results
+                    if is_final:
+                        # Store transcript for archival
+                        session_data.transcripts.append(transcript)
+                        
+                        # Detect SE terms using knowledge base
+                        detected_terms = se_knowledge_base.detect_se_terms(transcript)
+                        
+                        if detected_terms:
+                            # Track detected terms for session
+                            session_data.se_terms_detected.extend(detected_terms)
+                            
+                            # Build se_analysis array with definitions
+                            se_analysis = []
+                            for term in detected_terms:
+                                term_def = se_knowledge_base.get_term_definition(term)
+                                if term_def:
+                                    se_analysis.append({
+                                        "term": term_def.term,
+                                        "definition": term_def.definition,
+                                        "category": term_def.category
+                                    })
+                            
+                            if se_analysis:
+                                response_payload["se_analysis"] = se_analysis
+                                print(f"DEBUG - 🎯 SE Terms detected: {[t['term'] for t in se_analysis]}")
+                            
+                            # Phase 3: Level 2 (LLM) - Optional Gemini analysis
+                            # Fire-and-forget to avoid blocking the response loop
+                            asyncio.create_task(send_gemini_analysis(transcript, websocket))
+                    
+                    # Send response to frontend
+                    await websocket.send_json(response_payload)
+                    
             except Exception as e:
-                print(f"🔥 Google API Error: {e}")
+                # Phase 5: Error Handling - Send error to frontend
+                error_msg = str(e)
+                print(f"🔥 Google API Error: {error_msg}")
+                try:
+                    await websocket.send_json({
+                        "type": "error",
+                        "message": f"Google Speech API error: {error_msg}"
+                    })
+                except:
+                    pass  # WebSocket may already be closed
         
         stream_task = asyncio.create_task(listen_to_google())
         stream_started = True
+    
+    async def send_gemini_analysis(transcript: str, ws: WebSocket):
+        """
+        Phase 3: Level 2 (LLM) - Send Gemini analysis as separate message.
+        Non-blocking, fire-and-forget pattern.
+        """
+        try:
+            gemini_result = await gemini_service.analyze_transcript(transcript)
+            if gemini_result and gemini_result.keywords:
+                await ws.send_json({
+                    "type": "gemini_analysis",
+                    "original_text": gemini_result.original_text,
+                    "keywords": [
+                        {"term": kw.term, "explanation": kw.explanation}
+                        for kw in gemini_result.keywords
+                    ]
+                })
+                print(f"DEBUG - 🤖 Gemini analysis sent: {len(gemini_result.keywords)} terms")
+        except Exception as e:
+            print(f"DEBUG - ⚠️ Gemini analysis failed (non-blocking): {e}")
     
     try:
         while True:
             msg = await websocket.receive()
             
-            # 1. Handle Config (Start Session)
+            # Phase 1: Handle Config (Handshake) - MUST come first
             if msg["type"] == "websocket.receive" and "text" in msg:
                 try:
                     data = json.loads(msg["text"])
                     if data.get("type") == "start_session":
-                        # Use provided rate or default to 48000 (Browser default)
-                        rate = data.get("config", {}).get("sampleRate", 48000)
+                        # Phase 1: Read sampleRate and channels from config
+                        config = data.get("config", {})
+                        frontend_sample_rate = config.get("sampleRate")
+                        frontend_channels = config.get("channels", 2)  # Default to 2 (stereo) if missing
+                        
+                        if frontend_sample_rate is None:
+                            # Phase 1: Reject if no sample rate provided
+                            print("DEBUG - ❌ Config rejected: sampleRate is required")
+                            await websocket.send_json({
+                                "type": "error",
+                                "message": "Configuration error: sampleRate is required"
+                            })
+                            continue
+                        
+                        config_received = True
+                        print(f"DEBUG - ✅ Config received: {frontend_sample_rate}Hz, {frontend_channels}ch")
+                        
+                        # Phase 1: Initialize Google client only after config
                         if not stream_started:
-                            await start_recognition(rate)
-                except: 
+                            await start_recognition(frontend_sample_rate, frontend_channels)
+                            
+                except json.JSONDecodeError:
                     pass
             
-            # 2. Handle Audio
+            # Phase 1: Handle Audio - ONLY if config has been received
             if "bytes" in msg:
-                if not stream_started:
-                    # If we get audio before config, force start at 48kHz
-                    print("DEBUG - ⚠️ Auto-starting stream at 48000Hz")
-                    await start_recognition(48000)
+                if not config_received:
+                    # Phase 1: Drop audio before config - DO NOT auto-start with guessed rate
+                    print("DEBUG - ⚠️ Audio dropped: waiting for config (sampleRate required)")
+                    continue
                 
                 await audio_queue.put(msg["bytes"])
                 
+    except WebSocketDisconnect:
+        logger.info(f"🔌 Client Disconnected: {client_id}")
     except Exception as e:
         logger.error(f"❌ Socket Error: {e}")
     finally:
+        # Cleanup
         await audio_queue.put(None)
         if stream_task:
             stream_task.cancel()
-
-# 4. 响应循环: async for response in responses: if not response.results: continue result = response.results[0] transcript = result.alternatives[0].transcript # 只要有字就打印并发送，实现实时效果 print(f"DEBUG - 实时文字: {transcript} (Final: {result.is_final})") await websocket.send_json({"type": "transcript", "text": transcript, "is_final": result.is_final})
+        
+        # Session archival
+        session_data.end_time = datetime.now()
+        session_data.total_duration = (session_data.end_time - session_data.start_time).total_seconds()
+        
+        # Send email archive (non-blocking)
+        if email_service.is_configured and session_data.transcripts:
+            asyncio.create_task(email_service.send_session_archive(session_data))
+        
+        # Cleanup session
+        if client_id in active_sessions:
+            del active_sessions[client_id]
 
 if __name__ == "__main__":
     # Production deployment - Railway uses Procfile, this is for local development only
@@ -1026,10 +1178,10 @@ if __name__ == "__main__":
     
     logger.info("🚀 Starting SE Insight Railway Backend")
     logger.info(f"📡 Port: {port} (Railway: {bool(os.environ.get('RAILWAY_ENVIRONMENT'))})")
-    logger.info(f"🔑 Google API: {'Available' if GOOGLE_CLOUD_AVAILABLE else 'Not Available'}")
-    logger.info(f"🔐 GCP Key: {'Configured' if os.environ.get('GCP_KEY_JSON') else 'Not Configured'}")
+    logger.info(f"� Gaoogle API: {'Available' if GOOGLE_CLOUD_AVAILABLE else 'Not Available'}")
+    logger.info(f"� GCP Ke{y: {'Configured' if os.environ.get('GCP_KEY_JSON') else 'Not Configured'}")
     logger.info(f"🤖 Gemini API: {'Configured' if os.environ.get('GEMINI_API_KEY') else 'Not Configured'}")
-    logger.info(f"📧 Email Service: {'Configured' if email_service.is_configured else 'Not Configured'}")
+    logger.info(f"� ECmail Service: {'Configured' if email_service.is_configured else 'Not Configured'}")
     
     uvicorn.run(
         "main:app",
