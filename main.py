@@ -901,156 +901,122 @@ async def get_se_term_definition(term: str):
         "related_terms": term_def.related_terms
     }
 
-# TRACE MODE GENERATOR: Logs every step to find the silent failure
+# PASS-THROUGH MODE: Input is ALREADY Int16. Do not convert.
 async def request_generator(audio_queue, streaming_config):
-    """TRACE MODE GENERATOR: Logs every step to find the silent failure.
-    Includes standard Float32 -> Int16 conversion."""
-    
-    print("DEBUG - [1] Generator: STARTING. Sending Config...")
-    
-    # 1. Handshake: Send configuration first
+    """PASS-THROUGH MODE: Input is ALREADY Int16. Do not convert."""
+    print("DEBUG - [1] Generator: Sending Config...")
     yield speech.StreamingRecognizeRequest(streaming_config=streaming_config)
     
-    print("DEBUG - [2] Generator: Config Sent. Entering Loop...")
+    print("DEBUG - [2] Generator: Ready for Int16 audio...")
     
     chunk_buffer = bytearray()
-    
-    # Threshold: 320 bytes = ~10ms of audio (Int16) -> Instant response
-    # 84 bytes input (Float32) -> 42 bytes output (Int16)
-    # We need approx 8 packets to trigger a send.
-    BUFFER_THRESHOLD = 320
+    BUFFER_THRESHOLD = 1600  # 50ms at 16kHz, or ~16ms at 48kHz
     
     while True:
         try:
-            # Step 1: Wait for data
-            # print("DEBUG - [Loop] Waiting for queue...")
-            data = await audio_queue.get()
-            
+            # Step 1: Get Raw Bytes (Already Int16)
+            data = await asyncio.wait_for(audio_queue.get(), timeout=1.0)
             if data is None:
-                print("DEBUG - [End] Queue signal received. Exiting.")
+                print("DEBUG - [End] Queue closed.")
                 break
             
-            # Step 2: Conversion (Float32 -> Int16)
-            # Browser sends Float32 (84 bytes), we convert to Int16 (42 bytes)
-            try:
-                float_data = np.frombuffer(data, dtype=np.float32)
+            # Step 2: NO CONVERSION. Just Buffer.
+            # We assume data is already Linear16 PCM.
+            chunk_buffer.extend(data)
+            
+            # Step 3: Send
+            if len(chunk_buffer) >= BUFFER_THRESHOLD:
+                # print(f"DEBUG - 🚀 PUSHING {len(chunk_buffer)} bytes (Int16) to Google")
+                yield speech.StreamingRecognizeRequest(audio_content=bytes(chunk_buffer))
+                chunk_buffer.clear()
                 
-                # Sanitize (Prevent NaN crashes)
-                if not np.all(np.isfinite(float_data)):
-                    print("DEBUG - [Warn] NaN/Inf detected, sanitizing...")
-                    float_data = np.nan_to_num(float_data, nan=0.0, posinf=0.0, neginf=0.0)
-                
-                # Clip & Scale
-                float_data = np.clip(float_data, -1.0, 1.0)
-                int16_data = (float_data * 32767).astype(np.int16)
-                
-                # Step 3: Buffer
-                chunk_buffer.extend(int16_data.tobytes())
-                
-                # Trace log to prove we are alive (Only print every ~10 packets to avoid spam, or print all for now)
-                # print(f"DEBUG - [3] Buffered. Size: {len(chunk_buffer)} / {BUFFER_THRESHOLD}")
-                
-                # Step 4: Send if full
-                if len(chunk_buffer) >= BUFFER_THRESHOLD:
-                    print(f"DEBUG - [4] 🚀 SENDING {len(chunk_buffer)} bytes to Google!")
-                    yield speech.StreamingRecognizeRequest(audio_content=bytes(chunk_buffer))
-                    chunk_buffer.clear()
-                    
-            except Exception as e:
-                print(f"ERROR - Conversion/Buffer failed: {e}")
-                
-        except Exception as e:
-            print(f"ERROR - Queue/Loop failed: {e}")
-            break
+        except asyncio.TimeoutError:
+            if len(chunk_buffer) > 0:
+                yield speech.StreamingRecognizeRequest(audio_content=bytes(chunk_buffer))
+                chunk_buffer.clear()
+            continue
 
 @app.websocket("/ws/audio")
 async def websocket_audio_stream(websocket: WebSocket):
-    """WebSocket endpoint with LAZY Google Stream initialization (Sample Rate Fix)"""
+    """WebSocket endpoint with LAZY Google Stream initialization and Int16 pass-through"""
     await websocket.accept()
     client_id = f"client_{int(time.time() * 1000)}"
-    logger.info(f"🔌 Connected: {client_id}")
+    logger.info(f"🔌 Client Connected: {client_id}")
     
     audio_queue = asyncio.Queue()
-    stream_active = False
-    streaming_task = None
+    stream_task = None
+    stream_started = False
     
-    # Initialization Helper
-    async def start_google_stream(sample_rate):
-        nonlocal stream_active, streaming_task
-        print(f"DEBUG - 🟢 Starting Google Stream at {sample_rate}Hz...")
+    async def start_recognition(sample_rate):
+        nonlocal stream_task, stream_started
+        print(f"DEBUG - 🟢 Initializing Google Stream at {sample_rate}Hz (Linear16)")
         
-        # 1. Config with CORRECT Sample Rate
+        # Configure for Int16 (LINEAR16) at dynamic rate
         config = speech.RecognitionConfig(
             encoding=speech.RecognitionConfig.AudioEncoding.LINEAR16,
             sample_rate_hertz=sample_rate,
-            language_code="en-US",
+            language_code="en-US",  # Change to zh-CN if needed
             model="latest_long",
         )
         streaming_config = speech.StreamingRecognitionConfig(config=config, interim_results=True)
         
-        # 2. Start Generator & API Call
         requests = request_generator(audio_queue, streaming_config)
         responses = await google_client.client.streaming_recognize(
             requests=requests, 
             retry=retries.AsyncRetry()
         )
         
-        # 3. Response Loop
-        async def response_loop():
-            print("DEBUG - 👂 Listening for Google Responses...")
+        async def listen_to_google():
+            print("DEBUG - 👂 Listening for subtitles...")
             try:
                 async for response in responses:
                     if not response.results: 
                         continue
                     result = response.results[0]
                     transcript = result.alternatives[0].transcript
-                    print(f"DEBUG - 🗣️ SUBTITLE: {transcript}")
+                    print(f"DEBUG - 📝 Subtitle: {transcript}")
                     await websocket.send_json({
                         "type": "transcript",
                         "text": transcript,
                         "is_final": result.is_final
                     })
             except Exception as e:
-                print(f"🔥 Google Stream Error: {e}")
+                print(f"🔥 Google API Error: {e}")
         
-        streaming_task = asyncio.create_task(response_loop())
-        stream_active = True
+        stream_task = asyncio.create_task(listen_to_google())
+        stream_started = True
     
     try:
         while True:
-            # Wait for message
-            message = await websocket.receive()
+            msg = await websocket.receive()
             
-            # Case A: Config Message (Start Session)
-            if message["type"] == "websocket.receive" and "text" in message:
+            # 1. Handle Config (Start Session)
+            if msg["type"] == "websocket.receive" and "text" in msg:
                 try:
-                    data = json.loads(message["text"])
+                    data = json.loads(msg["text"])
                     if data.get("type") == "start_session":
-                        # Get rate from frontend, Default to 48000 (Browser Standard) if missing
+                        # Use provided rate or default to 48000 (Browser default)
                         rate = data.get("config", {}).get("sampleRate", 48000)
-                        if not stream_active:
-                            await start_google_stream(rate)
-                except:
+                        if not stream_started:
+                            await start_recognition(rate)
+                except: 
                     pass
             
-            # Case B: Audio Data (Bytes)
-            if "bytes" in message:
-                audio_data = message["bytes"]
+            # 2. Handle Audio
+            if "bytes" in msg:
+                if not stream_started:
+                    # If we get audio before config, force start at 48kHz
+                    print("DEBUG - ⚠️ Auto-starting stream at 48000Hz")
+                    await start_recognition(48000)
                 
-                # Lazy Start: If bytes arrive before config, assume 48000Hz (Safe Bet)
-                if not stream_active:
-                    print("DEBUG - ⚠️ Audio received before config. Defaulting to 48000Hz.")
-                    await start_google_stream(48000)
-                
-                # Push to queue
-                await audio_queue.put(audio_data)
+                await audio_queue.put(msg["bytes"])
                 
     except Exception as e:
-        logger.error(f"❌ Connection closed: {e}")
+        logger.error(f"❌ Socket Error: {e}")
     finally:
         await audio_queue.put(None)
-        if streaming_task:
-            streaming_task.cancel()
+        if stream_task:
+            stream_task.cancel()
 
 # 4. 响应循环: async for response in responses: if not response.results: continue result = response.results[0] transcript = result.alternatives[0].transcript # 只要有字就打印并发送，实现实时效果 print(f"DEBUG - 实时文字: {transcript} (Final: {result.is_final})") await websocket.send_json({"type": "transcript", "text": transcript, "is_final": result.is_final})
 
