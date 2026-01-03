@@ -58,6 +58,7 @@ class GeminiKeyword:
 class GeminiAnalysisResult:
     """Gemini API analysis result with Chinese explanations"""
     original_text: str
+    translation: str = ""  # 🔧 Added translation field
     keywords: List[GeminiKeyword] = field(default_factory=list)
 
 @dataclass
@@ -106,8 +107,14 @@ class GeminiAPIService:
         # Task 5: Keep the existing Gemini 2.0 Flash URL unchanged
         self.api_url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent"
         
-        # Optimized system instruction for gemini-2.0-flash real-time processing
-        self.system_instruction = """You are a Senior Software Engineering Professor analyzing real-time transcripts. Detect specialized SE terms (e.g., polymorphism, CI/CD, microservices, algorithms) and provide concise Chinese explanations (under 40 words). Return JSON format: {"original_text": "...", "keywords": [{"term": "term_name", "explanation": "Chinese_explanation"}]}. Empty keywords list if no SE terms found. No conversational text."""
+        # 🔧 UPGRADE: Added "translation" field to JSON response
+        self.system_instruction = """You are a Senior Software Engineering Professor. 
+
+1. TRANSLATE the transcript into professional Chinese.
+2. DETECT specialized SE terms (e.g., polymorphism, CI/CD) and provide concise Chinese explanations.
+3. Return JSON: {"original_text": "...", "translation": "Chinese_translation_of_sentence", "keywords": [{"term": "term_name", "explanation": "Chinese_explanation"}]}. 
+
+If no SE terms found, 'keywords' list should be empty, but ALWAYS provide 'translation'."""
         
         # Buffer mechanism to prevent too-frequent API calls (15 RPM rate limit)
         self.last_analysis_time = 0
@@ -247,6 +254,9 @@ class GeminiAPIService:
                 
                 parsed_result = json.loads(clean_text)
                 
+                # 🔧 Extract Translation
+                translation = parsed_result.get("translation", "")
+                
                 # Validate the expected structure
                 if "original_text" not in parsed_result or "keywords" not in parsed_result:
                     logger.warning("⚠️ Gemini response missing required fields")
@@ -263,6 +273,7 @@ class GeminiAPIService:
                 
                 result = GeminiAnalysisResult(
                     original_text=original_text,
+                    translation=translation,  # 🔧 Added translation field
                     keywords=keywords
                 )
                 
@@ -1159,7 +1170,37 @@ async def websocket_audio_stream(websocket: WebSocket):
                     # 2. ONLY trigger heavy SE analysis on Final results (to save API costs)
                     if is_final:
                         session_data.transcripts.append(transcript)
-                        # ... existing SE logic ...
+                        
+                        # 1. 🧠 Local Knowledge Base Analysis
+                        # Detect SE terms immediately (milliseconds)
+                        terms = se_knowledge_base.detect_se_terms(transcript)
+                        if terms:
+                            se_analysis = []
+                            for t in terms[:3]:  # Limit to top 3 terms
+                                def_obj = se_knowledge_base.get_term_definition(t)
+                                if def_obj:
+                                    se_analysis.append({
+                                        "term": def_obj.term,
+                                        "definition": def_obj.definition,
+                                        "category": def_obj.category
+                                    })
+                            
+                            # Send local analysis results immediately
+                            # (Ideally merged with transcript, but can be sent separately if needed)
+                            await websocket.send_json({
+                                "type": "transcript",
+                                "text": transcript,
+                                "is_final": True,
+                                "se_analysis": se_analysis,
+                                "timestamp": time.time()
+                            })
+                        
+                        # 2. 🤖 Gemini AI Analysis (Async Trigger)
+                        # "Fire and forget" - doesn't block the next audio packet
+                        if gemini_service.is_configured:
+                            # Only trigger for long enough sentences to save quota
+                            if len(transcript) > 10:
+                                asyncio.create_task(send_gemini_analysis(transcript, websocket))
                         
         except Exception as e:
             error_msg = str(e)
@@ -1186,25 +1227,28 @@ async def websocket_audio_stream(websocket: WebSocket):
         return True
     
     async def send_gemini_analysis(transcript: str, ws: WebSocket):
-        """Send Gemini analysis as separate message"""
+        """Send Gemini analysis (Translation + Keywords) as separate message"""
         if not gemini_service.is_configured:
             return
         
         try:
             gemini_result = await gemini_service.analyze_transcript(transcript)
-            if gemini_result and gemini_result.keywords:
+            # 🔧 FIX 1: Allow sending if we have EITHER keywords OR a translation
+            # Previously it blocked if keywords was empty.
+            if gemini_result and (gemini_result.keywords or gemini_result.translation):
                 await ws.send_json({
                     "type": "gemini_analysis",
-                    "original_text": gemini_result.original_text[:100],  # 限制长度
+                    "original_text": gemini_result.original_text[:200],
+                    "translation": gemini_result.translation,  # 🔧 FIX 2: Actually send the translation!
                     "keywords": [
                         {
                             "term": kw.term,
-                            "explanation": kw.explanation[:100]  # 限制长度
+                            "explanation": kw.explanation[:150]
                         }
-                        for kw in gemini_result.keywords[:3]  # 限制最多3个
+                        for kw in gemini_result.keywords[:3]
                     ]
                 })
-                print(f"DEBUG - 🤖 Gemini analysis sent: {len(gemini_result.keywords)} terms")
+                print(f"DEBUG - 🤖 Gemini sent: Translation + {len(gemini_result.keywords)} terms")
         except Exception as e:
             print(f"DEBUG - Gemini analysis failed: {e}")
     
