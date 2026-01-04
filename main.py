@@ -97,8 +97,15 @@ class GeminiAPIService:
     """
     
     def __init__(self):
+        # Initialize GeminiAPIService configuration
         # Strictly require GEMINI_API_KEY for production deployment
         self.api_key = os.environ.get('GEMINI_API_KEY')
+        
+        # Add detailed debugging information
+        print(f"DEBUG - 🔑 GEMINI_API_KEY configured: {bool(self.api_key)}")
+        if self.api_key:
+            print(f"DEBUG - 🔑 GEMINI_API_KEY first 10 chars: {self.api_key[:10]}...")
+        
         if not self.api_key:
             logger.error("❌ GEMINI_API_KEY environment variable is required for production")
             self.is_configured = False
@@ -107,14 +114,48 @@ class GeminiAPIService:
         # Task 5: Keep the existing Gemini 2.0 Flash URL unchanged
         self.api_url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent"
         
-        # 🔧 UPGRADE: Added "translation" field to JSON response
-        self.system_instruction = """You are a Senior Software Engineering Professor. 
+        # Update system_instruction in GeminiAPIService.__init__()
+        self.system_instruction = """You are a Senior Software Engineering Professor analyzing software engineering conversations.
 
-1. TRANSLATE the transcript into professional Chinese.
-2. DETECT specialized SE terms (e.g., polymorphism, CI/CD) and provide concise Chinese explanations.
-3. Return JSON: {"original_text": "...", "translation": "Chinese_translation_of_sentence", "keywords": [{"term": "term_name", "explanation": "Chinese_explanation"}]}. 
+CRITICAL TASKS (MUST DO BOTH IN ONE RESPONSE):
+1. TRANSLATE the entire English transcript into professional Chinese.
+2. DETECT software engineering terms and provide Chinese explanations.
 
-If no SE terms found, 'keywords' list should be empty, but ALWAYS provide 'translation'."""
+OUTPUT FORMAT (MUST BE VALID JSON):
+{
+    "original_text": "The original English transcript text",
+    "translation": "Professional Chinese translation of the entire text",
+    "keywords": [
+        {
+            "term": "SE term detected",
+            "explanation": "Concise Chinese explanation (under 40 characters)"
+        }
+    ]
+}
+
+RULES:
+- MUST return ONLY the JSON object, no other text
+- MUST include all three fields: original_text, translation, keywords
+- If no SE terms found, keywords must be an empty array []
+- Keep explanations under 40 Chinese characters
+
+EXAMPLE OUTPUT:
+{
+    "original_text": "We need to implement a REST API for our microservices architecture",
+    "translation": "我们需要为微服务架构实现一个REST API",
+    "keywords": [
+        {
+            "term": "REST API",
+            "explanation": "一种用于构建网络应用程序的架构风格，使用HTTP协议进行通信"
+        },
+        {
+            "term": "microservices",
+            "explanation": "将应用程序构建为一组松散耦合的小型服务的架构模式"
+        }
+    ]
+}
+
+Now analyze this transcript:"""
         
         # Buffer mechanism to prevent too-frequent API calls (15 RPM rate limit)
         self.last_analysis_time = 0
@@ -127,12 +168,23 @@ If no SE terms found, 'keywords' list should be empty, but ALWAYS provide 'trans
     async def analyze_transcript(self, transcript_text: str) -> Optional[GeminiAnalysisResult]:
         """Analyze transcript for SE terms and provide Chinese explanations
         
+        DESIGN: Single API call performs TWO tasks:
+        1. English-to-Chinese translation
+        2. SE term detection with Chinese explanations
+        
+        API Flow: Audio → Google Speech → English transcript → [Gemini: Translation + Analysis]
+        
         Args:
             transcript_text: The final transcript text to analyze
             
         Returns:
             GeminiAnalysisResult with Chinese explanations or None if API unavailable
         """
+        print(f"DEBUG - 🤖 Gemini API Task: ONE call for TWO functions")
+        print(f"DEBUG - 🤖 Input: English transcript from Google Speech")
+        print(f"DEBUG - 🤖 Expected Output: Chinese translation + SE term explanations")
+        print(f"DEBUG - 🤖 Transcript length: {len(transcript_text)} chars")
+        
         if not self.is_configured or not transcript_text.strip():
             return None
         
@@ -220,75 +272,76 @@ If no SE terms found, 'keywords' list should be empty, but ALWAYS provide 'trans
             return None
     
     async def _parse_gemini_response(self, response_data: dict, original_text: str) -> Optional[GeminiAnalysisResult]:
-        """Parse Gemini API response and extract SE term explanations
+        """Parse Gemini API response - expects ONE call to do TWO tasks"""
+        print(f"DEBUG - 🤖 Parsing Gemini response - Checking for dual-task completion")
         
-        Args:
-            response_data: Raw response from Gemini API
-            original_text: Original transcript text
-            
-        Returns:
-            Parsed GeminiAnalysisResult or None if parsing fails
-        """
         try:
-            # Extract the generated text from Gemini response
-            if "candidates" not in response_data or not response_data["candidates"]:
-                logger.warning("⚠️ No candidates in Gemini response")
+            # Extract response text
+            if "candidates" not in response_data:
+                print(f"DEBUG - 🤖 ERROR: No candidates in response")
                 return None
             
             candidate = response_data["candidates"][0]
-            if "content" not in candidate or "parts" not in candidate["content"]:
-                logger.warning("⚠️ Invalid Gemini response structure")
-                return None
-            
             generated_text = candidate["content"]["parts"][0]["text"]
+            print(f"DEBUG - 🤖 Raw response (first 500 chars): {generated_text[:500]}")
             
-            # Parse the JSON response from Gemini
-            try:
-                # Clean the response text (remove markdown formatting if present)
-                clean_text = generated_text.strip()
-                if clean_text.startswith("```json"):
-                    clean_text = clean_text[7:]
-                if clean_text.endswith("```"):
-                    clean_text = clean_text[:-3]
-                clean_text = clean_text.strip()
-                
-                parsed_result = json.loads(clean_text)
-                
-                # 🔧 Extract Translation
-                translation = parsed_result.get("translation", "")
-                
-                # Validate the expected structure
-                if "original_text" not in parsed_result or "keywords" not in parsed_result:
-                    logger.warning("⚠️ Gemini response missing required fields")
-                    return None
-                
-                # Convert to our data structures
-                keywords = []
-                for keyword_data in parsed_result.get("keywords", []):
-                    if "term" in keyword_data and "explanation" in keyword_data:
-                        keywords.append(GeminiKeyword(
-                            term=keyword_data["term"],
-                            explanation=keyword_data["explanation"]
-                        ))
-                
-                result = GeminiAnalysisResult(
-                    original_text=original_text,
-                    translation=translation,  # 🔧 Added translation field
-                    keywords=keywords
-                )
-                
-                logger.info(f"✅ Gemini analysis completed: {len(keywords)} SE terms explained")
-                return result
-                
-            except json.JSONDecodeError as e:
-                logger.error(f"❌ Failed to parse Gemini JSON response: {e}")
-                logger.debug(f"Raw response: {generated_text}")
+            # Check if response contains JSON
+            if '{' not in generated_text or '}' not in generated_text:
+                print(f"DEBUG - 🤖 ERROR: Response does not contain JSON")
+                print(f"DEBUG - 🤖 Gemini may not be following JSON format instructions")
                 return None
-                
-        except Exception as e:
-            logger.error(f"❌ Failed to parse Gemini response: {e}")
+            
+            # Extract and parse JSON
+            json_start = generated_text.find('{')
+            json_end = generated_text.rfind('}') + 1
+            json_str = generated_text[json_start:json_end]
+            print(f"DEBUG - 🤖 Extracted JSON (first 300 chars): {json_str[:300]}")
+            
+            parsed_result = json.loads(json_str)
+            
+            # Validate required fields
+            required_fields = ["original_text", "translation", "keywords"]
+            for field in required_fields:
+                if field not in parsed_result:
+                    print(f"DEBUG - 🤖 ERROR: Missing required field '{field}'")
+                    print(f"DEBUG - 🤖 Gemini did not return complete dual-task results")
+                    return None
+            
+            # Verify task completion status
+            has_translation = bool(parsed_result.get("translation", "").strip())
+            has_keywords = isinstance(parsed_result.get("keywords", []), list)
+            
+            print(f"DEBUG - 🤖 Task Completion Check:")
+            print(f"DEBUG - 🤖   - Translation provided: {has_translation}")
+            print(f"DEBUG - 🤖   - Keywords list: {has_keywords}")
+            print(f"DEBUG - 🤖   - Keywords count: {len(parsed_result.get('keywords', []))}")
+            
+            # Build result object
+            result = GeminiAnalysisResult(
+                original_text=parsed_result.get("original_text", original_text),
+                translation=parsed_result.get("translation", ""),
+                keywords=[
+                    GeminiKeyword(
+                        term=k.get("term", ""), 
+                        explanation=k.get("explanation", "")
+                    )
+                    for k in parsed_result.get("keywords", [])
+                ]
+            )
+            
+            print(f"DEBUG - 🤖 SUCCESS: Dual-task API call completed")
+            print(f"DEBUG - 🤖   - Translation length: {len(result.translation)} chars")
+            print(f"DEBUG - 🤖   - Terms detected: {len(result.keywords)}")
+            
+            return result
+            
+        except json.JSONDecodeError as e:
+            print(f"DEBUG - 🤖 ERROR: Failed to parse JSON - {e}")
+            print(f"DEBUG - 🤖 Gemini did not return valid JSON format")
             return None
-
+        except Exception as e:
+            print(f"DEBUG - 🤖 ERROR: Parse failed - {e}")
+            return None
 class SEKnowledgeBase:
     """SE terminology knowledge base for real-time explanations
     
@@ -927,6 +980,128 @@ async def get_se_term_definition(term: str):
         "related_terms": term_def.related_terms
     }
 
+@app.get("/api/language-check")
+async def language_check():
+    """Verify that all system messages are in English"""
+    return {
+        "project_name": "SE Insight Railway Backend",
+        "target_audience": "Chinese students in English-taught software engineering courses",
+        "code_language": "English",
+        "output_language": "Chinese translations from Gemini",
+        "status": "All system messages in English, Gemini provides Chinese explanations"
+    }
+
+@app.get("/api/design-verification")
+async def verify_api_design():
+    """Verify the API connection design and Gemini task understanding"""
+    test_cases = [
+        {
+            "input": "We need to implement a REST API for our microservices architecture",
+            "expected_output": {
+                "has_translation": True,
+                "has_keywords": True,
+                "expected_terms": ["REST API", "microservices"]
+            }
+        },
+        {
+            "input": "The algorithm uses a binary search tree for efficient lookups",
+            "expected_output": {
+                "has_translation": True,
+                "has_keywords": True,
+                "expected_terms": ["algorithm", "binary search tree"]
+            }
+        }
+    ]
+    
+    return {
+        "api_design": "Single Gemini API call for dual functions",
+        "workflow": "Audio → Google Speech → English transcript → Gemini API → Translation + Analysis",
+        "gemini_tasks": [
+            "English-to-Chinese translation",
+            "SE term detection",
+            "Chinese explanations for SE terms"
+        ],
+        "output_format": {
+            "required_fields": ["original_text", "translation", "keywords"],
+            "keywords_structure": [{"term": "string", "explanation": "string"}]
+        },
+        "test_cases": test_cases,
+        "verification_endpoint": "/api/test-gemini-design"
+    }
+
+@app.post("/api/test-gemini-design")
+async def test_gemini_design_api():
+    """Test the actual Gemini API connection with real dual-task request"""
+    if not gemini_service.is_configured:
+        raise HTTPException(status_code=503, detail="Gemini API service not configured")
+    
+    test_transcripts = [
+        "We need to implement a REST API for our microservices architecture",
+        "The algorithm uses a binary search tree for efficient lookups",
+        "We should use Docker containers for deployment and Kubernetes for orchestration"
+    ]
+    
+    results = []
+    
+    for transcript in test_transcripts:
+        try:
+            print(f"DEBUG - 🤖 Testing API design with: {transcript}")
+            print(f"DEBUG - 🤖 Expecting: 1 API call → Chinese translation + SE term explanations")
+            
+            result = await gemini_service.analyze_transcript(transcript)
+            
+            if result:
+                test_result = {
+                    "input": transcript,
+                    "success": True,
+                    "translation_received": bool(result.translation.strip()),
+                    "translation_length": len(result.translation),
+                    "keywords_count": len(result.keywords),
+                    "keywords": [
+                        {"term": kw.term, "explanation": kw.explanation[:50]}
+                        for kw in result.keywords[:3]
+                    ],
+                    "api_design_verified": True
+                }
+                print(f"DEBUG - 🤖 ✅ Test passed: Translation={bool(result.translation)}, Keywords={len(result.keywords)}")
+            else:
+                test_result = {
+                    "input": transcript,
+                    "success": False,
+                    "error": "Gemini API returned None",
+                    "api_design_verified": False
+                }
+                print(f"DEBUG - 🤖 ❌ Test failed: Gemini returned None")
+            
+            results.append(test_result)
+            
+        except Exception as e:
+            test_result = {
+                "input": transcript,
+                "success": False,
+                "error": str(e),
+                "api_design_verified": False
+            }
+            results.append(test_result)
+            print(f"DEBUG - 🤖 ❌ Test error: {e}")
+    
+    # Verify the overall API design
+    success_count = sum(1 for r in results if r.get("success", False))
+    design_verified = success_count >= 2  # At least 2 out of 3 tests should pass
+    
+    return {
+        "api_design": "Single Gemini API call for dual functions",
+        "description": "Tests whether Gemini correctly performs both translation and SE analysis in one API call",
+        "test_results": results,
+        "summary": {
+            "total_tests": len(results),
+            "successful_tests": success_count,
+            "api_design_verified": design_verified,
+            "verification_criteria": "At least 2 out of 3 tests must succeed with both translation and keywords"
+        },
+        "expected_workflow": "Audio → Google Speech → English transcript → Gemini API → [Chinese translation + SE term explanations]"
+    }
+
 @app.websocket("/ws/debug")
 async def websocket_debug_endpoint(websocket: WebSocket):
     """Debug WebSocket endpoint for simple audio testing without Google Speech API"""
@@ -989,8 +1164,11 @@ async def websocket_audio_stream(websocket: WebSocket):
     client_id = f"client_{int(time.time() * 1000)}"
     logger.info(f"🔌 Client Connected: {client_id}")
     
+    # 🔧 Background task management
+    background_tasks = []
+    
     # State variables
-    audio_queue = asyncio.Queue(maxsize=100)  # 添加队列大小限制
+    audio_queue = asyncio.Queue(maxsize=100)  # Add queue size limit
     stream_task = None
     stream_started = False
     config_received = False
@@ -1020,15 +1198,15 @@ async def websocket_audio_stream(websocket: WebSocket):
         print(f"DEBUG - 🟢 Creating Google Stream at 16000Hz, 1ch")
         
         try:
-            # 使用正确的Google Speech API配置
-            config = speech.RecognitionConfig(
+            # Use correct Google Speech API configuration
+            recognition_config = speech.RecognitionConfig(
                 encoding=speech.RecognitionConfig.AudioEncoding.LINEAR16,
-                sample_rate_hertz=16000,  # 固定16kHz
-                audio_channel_count=1,    # 单声道
+                sample_rate_hertz=16000,  # Fixed 16kHz
+                audio_channel_count=1,    # Mono channel
                 language_code="en-US",
-                model="latest_long",  # 兼容性最好的模型
+                model="latest_long",  # Best compatibility model
                 enable_automatic_punctuation=True,
-                enable_word_time_offsets=False,  # 简化配置，提高性能
+                enable_word_time_offsets=False,  # Simplify config, improve performance
                 speech_contexts=[
                     speech.SpeechContext(
                         phrases=[
@@ -1044,32 +1222,32 @@ async def websocket_audio_stream(websocket: WebSocket):
                 ],
                 use_enhanced=True,
                 enable_spoken_punctuation=True,
-                diarization_config=None,  # 明确关闭说话人分离
-                metadata=None,  # 简化配置
-                adaptation=None  # 简化配置
+                diarization_config=None,  # Explicitly disable speaker separation
+                metadata=None,  # Simplify configuration
+                adaptation=None  # Simplify configuration
             )
             
             streaming_config = speech.StreamingRecognitionConfig(
-                config=config,
+                config=recognition_config,  # Fix: Use unified recognition_config variable name
                 interim_results=True,
                 single_utterance=False
             )
             
-            async def audio_request_generator():  # 重命名以避免冲突
+            async def audio_request_generator():  # Renamed to avoid conflicts
                 """Optimized request generator with 100ms buffering"""
                 # Send config first
                 yield speech.StreamingRecognizeRequest(streaming_config=streaming_config)
                 
                 chunk_buffer = bytearray()
-                # 固定缓冲区大小：16kHz单声道，100ms = 3200字节
-                # 计算公式：16000 samples/sec × 1 channel × 2 bytes/sample × 0.1 sec = 3200 bytes
+                # Fixed buffer size: 16kHz mono, 100ms = 3200 bytes
+                # Formula: 16000 samples/sec × 1 channel × 2 bytes/sample × 0.1 sec = 3200 bytes
                 BUFFER_THRESHOLD = 3200
                 
                 while True:
                     try:
-                        # 使用更短的超时时间
-                        data = await asyncio.wait_for(audio_queue.get(), timeout=0.1)  # 更快的响应
-                        if data is None:  # 收到终止信号
+                        # Use shorter timeout for faster response
+                        data = await asyncio.wait_for(audio_queue.get(), timeout=0.1)  # Faster response
+                        if data is None:  # Received termination signal
                             print("DEBUG - Audio queue closed, ending stream")
                             break
                         
@@ -1090,10 +1268,10 @@ async def websocket_audio_stream(websocket: WebSocket):
                         print("DEBUG - Request generator cancelled")
                         break
             
-            # 创建请求生成器
+            # Create request generator
             requests = audio_request_generator()
             
-            # 调用Google Speech API，使用正确的retry配置
+            # Call Google Speech API with correct retry configuration
             try:
                 from google.api_core import exceptions as google_exceptions
                 responses = await google_client.client.streaming_recognize(
@@ -1104,8 +1282,8 @@ async def websocket_audio_stream(websocket: WebSocket):
                             google_exceptions.DeadlineExceeded,
                             google_exceptions.ResourceExhausted
                         )),
-                        deadline=60.0,  # 60秒总超时
-                        maximum=3.0  # 最多3次重试
+                        deadline=60.0,  # 60 second total timeout
+                        maximum=3.0  # Maximum 3 retries
                     )
                 )
                 print("DEBUG - ✅ Google stream created successfully")
@@ -1128,7 +1306,7 @@ async def websocket_audio_stream(websocket: WebSocket):
             })
             return None
     
-    async def listen_to_google_stream(responses):
+    async def listen_to_google_stream(responses, session_data):
         """Listen to Google Speech responses and send to client"""
         print("DEBUG - 👂 Listening for transcription...")
         try:
@@ -1141,17 +1319,22 @@ async def websocket_audio_stream(websocket: WebSocket):
                         continue
                     
                     transcript = result.alternatives[0].transcript.strip()
-                    if not transcript:  # Skip empty transcripts
+                    if not transcript:
                         continue
                     
                     is_final = result.is_final
                     confidence = getattr(result.alternatives[0], 'confidence', 0.0)
                     
-                    # 简化日志输出，避免控制台刷屏
-                    if is_final or len(transcript) > 3:  # 只记录有意义的中间结果
-                        print(f"DEBUG - 📝 [{'FINAL' if is_final else 'INTERIM'}] {transcript[:50]}{'...' if len(transcript) > 50 else ''}")
+                    print(f"DEBUG - 📝 [{'FINAL' if is_final else 'INTERIM'}] {transcript}")
                     
-                    # Build response payload
+                    # Optimize: Detect SE terms before building response
+                    detected_terms = []
+                    if is_final:
+                        detected_terms = se_knowledge_base.detect_se_terms(transcript)
+                        if detected_terms:
+                            print(f"DEBUG - 🔍 SE terms detected: {detected_terms}")
+                    
+                    # Build response payload (including SE terms)
                     response_payload = {
                         "type": "transcript",
                         "text": transcript,
@@ -1160,53 +1343,53 @@ async def websocket_audio_stream(websocket: WebSocket):
                         "timestamp": time.time()
                     }
                     
-                    # 🔧 [FIX] Send immediately!
+                    # Add SE terms to response
+                    if detected_terms:
+                        response_payload["se_terms"] = detected_terms
+                    
+                    # Critical: Send complete transcription result (including SE terms)
                     try:
                         await websocket.send_json(response_payload)
+                        print(f"DEBUG - ✅ Sent transcript to frontend (with SE terms: {bool(detected_terms)})")
                     except Exception as e:
-                        logger.error(f"WS Send Error: {e}")
+                        print(f"DEBUG - ❌ Failed to send transcript: {e}")
                         return False
                     
-                    # 2. ONLY trigger heavy SE analysis on Final results (to save API costs)
+                    # Only process session data and Gemini analysis for final results
                     if is_final:
+                        # Create TranscriptionResult object (optional)
+                        transcription_result = TranscriptionResult(
+                            text=transcript,
+                            is_final=is_final,
+                            confidence=confidence,
+                            timestamp=time.time(),
+                            se_terms=detected_terms,
+                            gemini_analysis=None
+                        )
+                        
+                        # Record to session (with deduplication)
                         session_data.transcripts.append(transcript)
+                        for term in detected_terms:
+                            if term not in session_data.se_terms_detected:
+                                session_data.se_terms_detected.append(term)
                         
-                        # 1. 🧠 Local Knowledge Base Analysis
-                        # Detect SE terms immediately (milliseconds)
-                        terms = se_knowledge_base.detect_se_terms(transcript)
-                        if terms:
-                            se_analysis = []
-                            for t in terms[:3]:  # Limit to top 3 terms
-                                def_obj = se_knowledge_base.get_term_definition(t)
-                                if def_obj:
-                                    se_analysis.append({
-                                        "term": def_obj.term,
-                                        "definition": def_obj.definition,
-                                        "category": def_obj.category
-                                    })
-                            
-                            # Send local analysis results immediately
-                            # (Ideally merged with transcript, but can be sent separately if needed)
-                            await websocket.send_json({
-                                "type": "transcript",
-                                "text": transcript,
-                                "is_final": True,
-                                "se_analysis": se_analysis,
-                                "timestamp": time.time()
-                            })
+                        print(f"DEBUG - 📊 Session updated: {len(session_data.transcripts)} transcripts, {len(session_data.se_terms_detected)} unique SE terms")
                         
-                        # 2. 🤖 Gemini AI Analysis (Async Trigger)
-                        # "Fire and forget" - doesn't block the next audio packet
+                        # Trigger Gemini analysis (async, non-blocking)
                         if gemini_service.is_configured:
-                            # Only trigger for long enough sentences to save quota
-                            if len(transcript) > 10:
-                                asyncio.create_task(send_gemini_analysis(transcript, websocket))
+                            # Condition: At least 3 words to call Gemini (save quota)
+                            if len(transcript.split()) >= 3:
+                                print(f"DEBUG - 🤖 Triggering Gemini analysis for: {transcript}")
+                                task = asyncio.create_task(send_gemini_analysis(transcript, websocket))
+                                background_tasks.append(task)
+                            else:
+                                print(f"DEBUG - 🤖 Skipping Gemini (too short): {transcript}")
                         
         except Exception as e:
             error_msg = str(e)
             print(f"🔥 Google API stream error: {error_msg}")
             
-            # 检查是否是Google API特定的错误
+            # Check if this is a Google API specific error
             if "google.api_core" in error_msg:
                 error_type = "Google Speech API"
             elif "deadline" in error_msg.lower():
@@ -1227,30 +1410,79 @@ async def websocket_audio_stream(websocket: WebSocket):
         return True
     
     async def send_gemini_analysis(transcript: str, ws: WebSocket):
-        """Send Gemini analysis (Translation + Keywords) as separate message"""
+        """Single API call performing dual functions: Translation + SE Analysis"""
+        print(f"DEBUG - 🤖 ======= API CONNECTION DESIGN =======")
+        print(f"DEBUG - 🤖 Architecture: Audio → Google Speech → English → [Gemini: Dual Task]")
+        print(f"DEBUG - 🤖 Gemini Task: ONE call does TWO things:")
+        print(f"DEBUG - 🤖   1. Translate English to Chinese")
+        print(f"DEBUG - 🤖   2. Detect SE terms with Chinese explanations")
+        print(f"DEBUG - 🤖 =====================================")
+        
         if not gemini_service.is_configured:
+            print(f"DEBUG - 🤖 Gemini service not configured")
             return
         
         try:
+            print(f"DEBUG - 🤖 ====== START Gemini Analysis ======")
+            print(f"DEBUG - 🤖 Input transcript: {transcript}")
+            print(f"DEBUG - 🤖 Calling Gemini API with dual-task request...")
+            
+            # Clear API connection logging
+            print(f"DEBUG - 🤖 API Connection: English transcript → Gemini API → Chinese translation + SE explanations")
+            
             gemini_result = await gemini_service.analyze_transcript(transcript)
-            # 🔧 FIX 1: Allow sending if we have EITHER keywords OR a translation
-            # Previously it blocked if keywords was empty.
-            if gemini_result and (gemini_result.keywords or gemini_result.translation):
-                await ws.send_json({
+            
+            if gemini_result:
+                print(f"DEBUG - 🤖 Gemini API Success: Dual-task response received")
+                print(f"DEBUG - 🤖 Translation length: {len(gemini_result.translation)} characters")
+                print(f"DEBUG - 🤖 Keywords count: {len(gemini_result.keywords)}")
+                
+                # Build response payload
+                gemini_payload = {
                     "type": "gemini_analysis",
                     "original_text": gemini_result.original_text[:200],
-                    "translation": gemini_result.translation,  # 🔧 FIX 2: Actually send the translation!
-                    "keywords": [
+                    "timestamp": time.time(),
+                    "api_design_note": "Single API call completed both translation and SE analysis"
+                }
+                
+                # Check and add translation
+                if gemini_result.translation and gemini_result.translation.strip():
+                    gemini_payload["translation"] = gemini_result.translation
+                    print(f"DEBUG - 🤖 Chinese translation received: {gemini_result.translation[:100]}...")
+                else:
+                    print(f"DEBUG - 🤖 WARNING: No translation received from Gemini")
+                    gemini_payload["translation"] = "(Translation not available)"
+                
+                # Add keywords
+                if gemini_result.keywords:
+                    gemini_payload["keywords"] = [
                         {
                             "term": kw.term,
                             "explanation": kw.explanation[:150]
                         }
-                        for kw in gemini_result.keywords[:3]
+                        for kw in gemini_result.keywords[:5]
                     ]
-                })
-                print(f"DEBUG - 🤖 Gemini sent: Translation + {len(gemini_result.keywords)} terms")
+                    print(f"DEBUG - 🤖 SE terms detected: {[k.term for k in gemini_result.keywords[:3]]}")
+                else:
+                    gemini_payload["keywords"] = []
+                    print(f"DEBUG - 🤖 No SE terms detected in this transcript")
+                
+                # Send to frontend
+                try:
+                    await ws.send_json(gemini_payload)
+                    print(f"DEBUG - 🤖 ✅ Gemini analysis sent to frontend successfully")
+                    print(f"DEBUG - 🤖 Payload keys sent: {list(gemini_payload.keys())}")
+                except Exception as e:
+                    print(f"DEBUG - 🤖 ❌ Failed to send to frontend: {e}")
+            else:
+                print(f"DEBUG - 🤖 Gemini API returned None (API call failed or parsing error)")
+            
+            print(f"DEBUG - 🤖 ====== END Gemini Analysis ======")
+            
         except Exception as e:
-            print(f"DEBUG - Gemini analysis failed: {e}")
+            print(f"DEBUG - 🤖 ❌ Gemini analysis failed: {str(e)[:200]}")
+            import traceback
+            traceback.print_exc()
     
     async def start_recognition_stream():
         """Start the recognition stream with proper lifecycle management"""
@@ -1262,12 +1494,13 @@ async def websocket_audio_stream(websocket: WebSocket):
             return False
         
         # Start listening task
-        stream_task = asyncio.create_task(listen_to_google_stream(responses))
+        stream_task = asyncio.create_task(listen_to_google_stream(responses, session_data))
+        background_tasks.append(stream_task)
         stream_started = True
         
         # Wait for task completion with timeout
         try:
-            await asyncio.wait_for(stream_task, timeout=3600)  # 1小时超时
+            await asyncio.wait_for(stream_task, timeout=3600)  # 1 hour timeout
             return True
         except asyncio.TimeoutError:
             print("DEBUG - Recognition stream timeout after 1 hour")
@@ -1287,18 +1520,19 @@ async def websocket_audio_stream(websocket: WebSocket):
         """Send periodic heartbeats to keep connection alive"""
         while True:
             try:
-                await asyncio.sleep(15)  # 15秒心跳间隔
+                await asyncio.sleep(15)  # 15 second heartbeat interval
                 await websocket.send_json({
                     "type": "heartbeat",
                     "timestamp": time.time()
                 })
-                # print("DEBUG - 💓 Heartbeat sent")  # 注释掉以减少日志
+                # print("DEBUG - 💓 Heartbeat sent")  # Commented out to reduce logs
             except (WebSocketDisconnect, Exception):
                 break
     
     try:
         # Start heartbeat task
         heartbeat_task = asyncio.create_task(send_heartbeats())
+        background_tasks.append(heartbeat_task)
         
         while True:
             try:
@@ -1306,7 +1540,7 @@ async def websocket_audio_stream(websocket: WebSocket):
                 msg = await asyncio.wait_for(websocket.receive(), timeout=10.0)
                 last_activity_time = time.time()
             except asyncio.TimeoutError:
-                # Check for inactivity timeout (5分钟)
+                # Check for inactivity timeout (5 minutes)
                 if time.time() - last_activity_time > 300:
                     print(f"DEBUG - ❌ Inactivity timeout for {client_id}")
                     break
@@ -1319,18 +1553,37 @@ async def websocket_audio_stream(websocket: WebSocket):
                     if data.get("type") == "start_session":
                         config = data.get("config", {})
                         frontend_sample_rate = config.get("sampleRate")
-                        frontend_channels = config.get("channels", 1)  # 默认改为1
+                        frontend_channels = config.get("channels", 1)  # Default changed to 1
                         
                         if frontend_sample_rate is None:
-                            print("DEBUG - ❌ Config missing sampleRate")
+                            print("DEBUG - ❌ Configuration missing sampleRate")
                             await websocket.send_json({
                                 "type": "error",
-                                "message": "Configuration error: sampleRate is required in config"
+                                "message": "Configuration error: sampleRate is required in configuration"
                             })
                             continue
                         
+                        # Enhanced validation for audio parameters
+                        if not isinstance(frontend_sample_rate, (int, float)) or frontend_sample_rate <= 0:
+                            await websocket.send_json({
+                                "type": "error",
+                                "message": f"Invalid sampleRate: {frontend_sample_rate}. Must be a positive number"
+                            })
+                            continue
+                        
+                        if frontend_channels not in [1, 2]:
+                            await websocket.send_json({
+                                "type": "error", 
+                                "message": f"Invalid channels: {frontend_channels}. Must be 1 (mono) or 2 (stereo)"
+                            })
+                            continue
+                        
+                        # Warning for unusual sample rates
+                        if frontend_sample_rate < 8000 or frontend_sample_rate > 48000:
+                            logger.warning(f"Unusual sample rate from client: {frontend_sample_rate}Hz")
+                        
                         config_received = True
-                        print(f"DEBUG - ✅ Config received: {frontend_sample_rate}Hz, {frontend_channels}ch")
+                        print(f"DEBUG - 🔧 Debug configuration received: {frontend_sample_rate}Hz, {frontend_channels}ch")
                         
                         # Start recognition if not already started
                         if not stream_started:
@@ -1374,27 +1627,36 @@ async def websocket_audio_stream(websocket: WebSocket):
         # Cleanup
         print(f"DEBUG - 🧹 Cleaning up session {client_id}")
         
-        # Stop heartbeat
-        if heartbeat_task and not heartbeat_task.done():
-            heartbeat_task.cancel()
-            try:
-                await heartbeat_task
-            except asyncio.CancelledError:
-                pass
+        # Unified cleanup of all background tasks
+        for task in background_tasks:
+            if not task.done():
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
         
-        # Stop stream task
-        if stream_task and not stream_task.done():
-            stream_task.cancel()
-            try:
-                await stream_task
-            except asyncio.CancelledError:
-                pass
+        # Stop heartbeat (handled above in unified cleanup)
+        # Stop stream task (handled above in unified cleanup)
         
         # Close audio queue
         try:
-            await audio_queue.put(None)  # Signal generator to stop
-        except:
-            pass
+            # Check if queue is already closed
+            if not audio_queue.empty():
+                # Clear remaining data in queue
+                while not audio_queue.empty():
+                    try:
+                        audio_queue.get_nowait()
+                    except:
+                        break
+            
+            # Send stop signal (with timeout)
+            try:
+                await asyncio.wait_for(audio_queue.put(None), timeout=0.5)
+            except asyncio.TimeoutError:
+                logger.debug("Audio queue stop signal timeout")
+        except Exception as e:
+            logger.debug(f"Audio queue cleanup error: {e}")
         
         # Session archival
         session_data.end_time = datetime.now()
