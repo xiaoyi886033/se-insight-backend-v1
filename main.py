@@ -1602,7 +1602,44 @@ async def websocket_audio_stream(websocket: WebSocket):
             if msg["type"] == "websocket.receive" and "text" in msg:
                 try:
                     data = json.loads(msg["text"])
-                    if data.get("type") == "start_session":
+                    
+                    # 🔥 新增：处理前端发送的转录消息
+                    if data.get("type") == "transcription":
+                        transcription_data = data.get("data", {})
+                        text = transcription_data.get("text", "")
+                        is_final = transcription_data.get("is_final", False)
+                        
+                        print(f"DEBUG - 📝 收到前端转录: {text} (final: {is_final})")
+                        
+                        # 如果是最终转录，触发Gemini分析
+                        if is_final and text.strip():
+                            print(f"DEBUG - 🤖 触发Gemini分析: {text}")
+                            try:
+                                gemini_queue.put_nowait(text)
+                            except asyncio.QueueFull:
+                                print(f"DEBUG - 🤖 Gemini队列满，跳过分析")
+                        
+                        continue
+                    
+                    # 🔥 新增：处理完整句子消息
+                    elif data.get("type") == "complete_sentence":
+                        sentence_data = data.get("data", {})
+                        sentence = sentence_data.get("sentence", "")
+                        
+                        print(f"DEBUG - 📖 收到完整句子: {sentence}")
+                        
+                        # 立即触发Gemini分析
+                        if sentence.strip():
+                            try:
+                                gemini_queue.put_nowait(sentence)
+                                print(f"DEBUG - 🤖 完整句子已加入Gemini分析队列")
+                            except asyncio.QueueFull:
+                                print(f"DEBUG - 🤖 Gemini队列满，跳过完整句子分析")
+                        
+                        continue
+                    
+                    # 原有的start_session处理
+                    elif data.get("type") == "start_session":
                         config = data.get("config", {})
                         frontend_sample_rate = config.get("sampleRate")
                         frontend_channels = config.get("channels", 1)  # Default changed to 1
