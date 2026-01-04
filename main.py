@@ -114,6 +114,9 @@ class GeminiAPIService:
         # Task 5: Keep the existing Gemini 2.0 Flash URL unchanged
         self.api_url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent"
         
+        # Add real-time sending flag
+        self.realtime_mode = True  # Default to real-time mode
+        
         # Update system_instruction in GeminiAPIService.__init__()
         self.system_instruction = """You are a Senior Software Engineering Professor analyzing software engineering conversations.
 
@@ -163,7 +166,7 @@ Now analyze this transcript:"""
         self.pending_transcripts = []
         
         self.is_configured = True
-        logger.info("✅ Gemini API service configured with gemini-2.0-flash for real-time SE term explanations")
+        logger.info(f"✅ Gemini API service configured with gemini-2.0-flash for real-time SE term explanations (realtime_mode={self.realtime_mode})")
     
     async def analyze_transcript(self, transcript_text: str) -> Optional[GeminiAnalysisResult]:
         """Analyze transcript for SE terms and provide Chinese explanations
@@ -1164,7 +1167,10 @@ async def websocket_audio_stream(websocket: WebSocket):
     client_id = f"client_{int(time.time() * 1000)}"
     logger.info(f"🔌 Client Connected: {client_id}")
     
-    # 🔧 Background task management
+    # Add Gemini analysis queue to ensure ordered processing
+    gemini_queue = asyncio.Queue(maxsize=10)
+    
+    # Background task management
     background_tasks = []
     
     # State variables
@@ -1183,6 +1189,23 @@ async def websocket_audio_stream(websocket: WebSocket):
         start_time=datetime.now()
     )
     active_sessions[client_id] = session_data
+    
+    async def gemini_processor():
+        """Process Gemini analysis queue to ensure ordered sending"""
+        while True:
+            try:
+                transcript = await gemini_queue.get()
+                if transcript is None:  # Stop signal
+                    break
+                print(f"DEBUG - 🤖 Processing Gemini analysis for: {transcript}")
+                await send_gemini_analysis(transcript, websocket)
+                gemini_queue.task_done()
+            except Exception as e:
+                print(f"DEBUG - 🤖 Gemini processor error: {e}")
+    
+    # Start Gemini processor
+    gemini_processor_task = asyncio.create_task(gemini_processor())
+    background_tasks.append(gemini_processor_task)
     
     async def create_google_stream():
         """Create and manage Google Speech API stream with proper error handling"""
@@ -1357,16 +1380,6 @@ async def websocket_audio_stream(websocket: WebSocket):
                     
                     # Only process session data and Gemini analysis for final results
                     if is_final:
-                        # Create TranscriptionResult object (optional)
-                        transcription_result = TranscriptionResult(
-                            text=transcript,
-                            is_final=is_final,
-                            confidence=confidence,
-                            timestamp=time.time(),
-                            se_terms=detected_terms,
-                            gemini_analysis=None
-                        )
-                        
                         # Record to session (with deduplication)
                         session_data.transcripts.append(transcript)
                         for term in detected_terms:
@@ -1375,15 +1388,32 @@ async def websocket_audio_stream(websocket: WebSocket):
                         
                         print(f"DEBUG - 📊 Session updated: {len(session_data.transcripts)} transcripts, {len(session_data.se_terms_detected)} unique SE terms")
                         
-                        # Trigger Gemini analysis (async, non-blocking)
-                        if gemini_service.is_configured:
-                            # Condition: At least 3 words to call Gemini (save quota)
-                            if len(transcript.split()) >= 3:
-                                print(f"DEBUG - 🤖 Triggering Gemini analysis for: {transcript}")
-                                task = asyncio.create_task(send_gemini_analysis(transcript, websocket))
-                                background_tasks.append(task)
-                            else:
-                                print(f"DEBUG - 🤖 Skipping Gemini (too short): {transcript}")
+                        # ⚡️ Modified triggering logic: Smarter Gemini analysis triggering
+                        # Optimize conditions: Based on content and length to decide whether to call Gemini
+                        should_call_gemini = False
+                        
+                        # Condition 1: Has sufficient content (at least 3 words)
+                        word_count = len(transcript.split())
+                        
+                        # Condition 2: Contains SE terms or important technical content
+                        has_technical_content = any(keyword in transcript.lower() for keyword in [
+                            'api', 'microservice', 'database', 'algorithm', 'docker',
+                            'kubernetes', 'rest', 'graphql', 'design pattern', 'framework'
+                        ])
+                        
+                        # Condition 3: Avoid duplicate analysis of very similar text
+                        if word_count >= 3 and (has_technical_content or word_count >= 5):
+                            should_call_gemini = True
+                        
+                        if should_call_gemini:
+                            print(f"DEBUG - 🤖 Queueing Gemini analysis for: {transcript}")
+                            try:
+                                # Use non-blocking method to add to queue
+                                gemini_queue.put_nowait(transcript)
+                            except asyncio.QueueFull:
+                                print(f"DEBUG - 🤖 Gemini queue full, dropping analysis for: {transcript}")
+                        else:
+                            print(f"DEBUG - 🤖 Skipping Gemini (content criteria not met): {transcript}")
                         
         except Exception as e:
             error_msg = str(e)
@@ -1410,7 +1440,7 @@ async def websocket_audio_stream(websocket: WebSocket):
         return True
     
     async def send_gemini_analysis(transcript: str, ws: WebSocket):
-        """Single API call performing dual functions: Translation + SE Analysis"""
+        """Single API call performing dual functions: Translation + SE Analysis - Real-time sending"""
         print(f"DEBUG - 🤖 ======= API CONNECTION DESIGN =======")
         print(f"DEBUG - 🤖 Architecture: Audio → Google Speech → English → [Gemini: Dual Task]")
         print(f"DEBUG - 🤖 Gemini Task: ONE call does TWO things:")
@@ -1460,20 +1490,42 @@ async def websocket_audio_stream(websocket: WebSocket):
                             "term": kw.term,
                             "explanation": kw.explanation[:150]
                         }
-                        for kw in gemini_result.keywords[:5]
+                        for kw in gemini_result.keywords[:5]  # Limit to max 5 keywords for display
                     ]
                     print(f"DEBUG - 🤖 SE terms detected: {[k.term for k in gemini_result.keywords[:3]]}")
                 else:
                     gemini_payload["keywords"] = []
                     print(f"DEBUG - 🤖 No SE terms detected in this transcript")
                 
-                # Send to frontend
+                # ⚡️ Critical modification: Send immediately to frontend
                 try:
                     await ws.send_json(gemini_payload)
-                    print(f"DEBUG - 🤖 ✅ Gemini analysis sent to frontend successfully")
+                    print(f"DEBUG - 🤖 ✅ Gemini analysis sent to frontend immediately")
                     print(f"DEBUG - 🤖 Payload keys sent: {list(gemini_payload.keys())}")
+                    
+                    # Also record results to session_data for later archival
+                    # Create TranscriptionResult object and store
+                    transcription_result = TranscriptionResult(
+                        text=transcript,
+                        is_final=True,
+                        confidence=0.0,  # Gemini analysis has no confidence score
+                        timestamp=time.time(),
+                        se_terms=[kw.term for kw in gemini_result.keywords],
+                        gemini_analysis=gemini_result
+                    )
+                    
+                    # Add results to session_data
+                    session_data.transcripts.append(transcript)
+                    if gemini_result.keywords:
+                        for kw in gemini_result.keywords:
+                            if kw.term not in session_data.se_terms_detected:
+                                session_data.se_terms_detected.append(kw.term)
+                    
+                    print(f"DEBUG - 📊 Session updated with Gemini analysis")
+                    
                 except Exception as e:
                     print(f"DEBUG - 🤖 ❌ Failed to send to frontend: {e}")
+                    # Record error but continue processing
             else:
                 print(f"DEBUG - 🤖 Gemini API returned None (API call failed or parsing error)")
             
@@ -1626,6 +1678,15 @@ async def websocket_audio_stream(websocket: WebSocket):
     finally:
         # Cleanup
         print(f"DEBUG - 🧹 Cleaning up session {client_id}")
+        
+        # Stop Gemini processor
+        try:
+            gemini_queue.put_nowait(None)  # Send stop signal
+            await asyncio.wait_for(gemini_processor_task, timeout=2.0)
+        except (asyncio.QueueFull, asyncio.TimeoutError):
+            print(f"DEBUG - 🤖 Gemini processor cleanup timeout")
+        except Exception as e:
+            print(f"DEBUG - 🤖 Gemini processor cleanup error: {e}")
         
         # Unified cleanup of all background tasks
         for task in background_tasks:
