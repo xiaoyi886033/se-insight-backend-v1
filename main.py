@@ -786,49 +786,37 @@ def resample_audio(audio_data: bytes, from_rate: int, to_rate: int = 16000, chan
 
 
 class GoogleSpeechClient:
-    """Google Speech API client - Railway deployment optimized
-    
-    Task 3: MUST use speech_v1.SpeechAsyncClient for async generator compatibility
-    """
-    
     def __init__(self):
         self.client = None
         self.audio_config = AudioConfig()
         self.setup_client()
     
     def setup_client(self):
-        """Initialize Google Speech client directly from JSON string (No temp files)"""
+        """Initialize Google Speech client using ADC or JSON credentials"""
         if not GOOGLE_CLOUD_AVAILABLE:
-            logger.error("❌ Google Cloud Speech API v1 not available")
-            return
-        
-        gcp_key_json = os.environ.get('GCP_KEY_JSON')
-        if not gcp_key_json:
-            logger.error("❌ GCP_KEY_JSON environment variable is missing")
-            self.client = None
             return
         
         try:
-            from google.oauth2 import service_account
+            gcp_key_json = os.environ.get('GCP_KEY_JSON')
             
-            # Handle base64 encoding if present
-            if not gcp_key_json.strip().startswith('{'):
-                gcp_key_json = base64.b64decode(gcp_key_json).decode('utf-8')
-            
-            # Parse JSON string to dict
-            service_account_info = json.loads(gcp_key_json)
-            
-            # Create credentials object directly from info
-            credentials = service_account.Credentials.from_service_account_info(
-                service_account_info
-            )
-            
-            # Initialize client with explicit credentials
-            self.client = speech.SpeechAsyncClient(credentials=credentials)
-            logger.info("✅ Google Speech v1 AsyncClient initialized successfully (Memory Auth)")
-            
+            if gcp_key_json:
+                # 兼容旧的 JSON 模式
+                import base64
+                if not gcp_key_json.strip().startswith('{'):
+                    gcp_key_json = base64.b64decode(gcp_key_json).decode('utf-8')
+                
+                from google.oauth2 import service_account
+                info = json.loads(gcp_key_json)
+                credentials = service_account.Credentials.from_service_account_info(info)
+                self.client = speech.SpeechAsyncClient(credentials=credentials)
+                logger.info("✅ Initialized with JSON")
+            else:
+                # ☁️ 核心修复：开启 ADC 模式
+                self.client = speech.SpeechAsyncClient()
+                logger.info("✅ Initialized with Application Default Credentials (ADC)")
+                
         except Exception as e:
-            logger.error(f"❌ Failed to initialize Google Client: {e}")
+            logger.error(f"❌ Initialization failed: {e}")
             self.client = None
     
     def get_recognition_config(self):
@@ -927,24 +915,18 @@ async def root():
 
 @app.get("/health")
 async def health_check():
-    """Health check endpoint for Railway deployment monitoring"""
+    auth_method = "ADC" if os.environ.get('GCP_KEY_JSON') is None else "JSON"
+    
     return {
-        "status": "healthy",
+        "status": "healthy" if google_client.client else "starting",
         "timestamp": time.time(),
         "google_api_available": GOOGLE_CLOUD_AVAILABLE,
         "client_initialized": google_client.client is not None,
-        "gcp_key_configured": bool(os.environ.get('GCP_KEY_JSON')),
+        "authentication_method": auth_method,
         "project": "upm-se-assistant",
         "features": {
             "se_knowledge_base": len(se_knowledge_base.knowledge_graph),
-            "email_archival": email_service.is_configured,
-            "gemini_api": gemini_service.is_configured,
-            "active_sessions": len(active_sessions)
-        },
-        "audio_config": {
-            "sample_rate": google_client.audio_config.sample_rate,
-            "channels": google_client.audio_config.channels,
-            "bit_depth": google_client.audio_config.bit_depth
+            "gemini_api": gemini_service.is_configured
         }
     }
 
