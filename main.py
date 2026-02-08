@@ -1,7 +1,7 @@
 ﻿#!/usr/bin/env python3
 """
-SE Insight Cloud Backend - FastAPI with Google Speech API
-Optimized for Google Cloud Run deployment with Application Default Credentials
+SE Insight Railway Backend - FastAPI with Google Speech API
+Refactored: Preserving ALL original features + Applying Critical Fixes
 """
 
 import asyncio
@@ -117,10 +117,6 @@ class GeminiAPIService:
         # Add real-time sending flag
         self.realtime_mode = True  # Default to real-time mode
         
-        # 🔧 [FIX] Disable rate limiting completely to restore basic functionality
-        self.test_mode = True
-        self.min_interval = 0.0
-        
         # Update system_instruction in GeminiAPIService.__init__()
         self.system_instruction = """You are a Senior Software Engineering Professor analyzing software engineering conversations.
 
@@ -166,10 +162,11 @@ Now analyze this transcript:"""
         
         # Buffer mechanism to prevent too-frequent API calls (15 RPM rate limit)
         self.last_analysis_time = 0
+        self.min_interval = 2.0  # Minimum 2 seconds between Gemini API calls (stays within 15 RPM)
         self.pending_transcripts = []
         
         self.is_configured = True
-        logger.info(f"✅ Gemini API service configured with gemini-2.0-flash (rate limit: {self.min_interval}s)")
+        logger.info(f"✅ Gemini API service configured with gemini-2.0-flash for real-time SE term explanations (realtime_mode={self.realtime_mode})")
     
     async def analyze_transcript(self, transcript_text: str) -> Optional[GeminiAnalysisResult]:
         """Analyze transcript for SE terms and provide Chinese explanations
@@ -194,21 +191,12 @@ Now analyze this transcript:"""
         if not self.is_configured or not transcript_text.strip():
             return None
         
-        # Buffer mechanism: Only call Gemini API based on interval
+        # Buffer mechanism: Only call Gemini API every 2+ seconds
         current_time = time.time()
-        time_since_last = current_time - self.last_analysis_time
-        
-        if time_since_last < self.min_interval:
-            if self.test_mode:
-                # Test mode: No buffering, process immediately
-                logger.info(f"🧪 TEST MODE: Processing request {time_since_last:.2f}s after last")
-                # Continue to process immediately, don't buffer
-            else:
-                # Production mode: Buffer requests
-                wait_time = self.min_interval - time_since_last
-                logger.debug(f"⏰ Gemini API call buffered - waiting {wait_time:.2f}s")
-                self.pending_transcripts.append(transcript_text)
-                return None
+        if current_time - self.last_analysis_time < self.min_interval:
+            logger.debug(f"⏰ Gemini API call buffered - waiting {self.min_interval}s interval")
+            self.pending_transcripts.append(transcript_text)
+            return None
         
         # Process accumulated transcripts
         if self.pending_transcripts:
@@ -260,7 +248,7 @@ Now analyze this transcript:"""
                 "Content-Type": "application/json"
             }
             
-            # Ensure API key is passed as query parameter for cloud compatibility
+            # Ensure API key is passed as query parameter for Railway compatibility
             url = f"{self.api_url}?key={self.api_key}"
             
             logger.info(f"🤖 Making Gemini API request to: {self.api_url}")
@@ -288,8 +276,7 @@ Now analyze this transcript:"""
     
     async def _parse_gemini_response(self, response_data: dict, original_text: str) -> Optional[GeminiAnalysisResult]:
         """Parse Gemini API response - expects ONE call to do TWO tasks"""
-        print(f"✅ [DEBUG-TEST] 开始解析Gemini响应")
-        print(f"✅ [DEBUG-TEST] 原始文本长度: {len(original_text)}")
+        print(f"DEBUG - 🤖 Parsing Gemini response - Checking for dual-task completion")
         
         try:
             # Extract response text
@@ -345,17 +332,21 @@ Now analyze this transcript:"""
                 ]
             )
             
-            print(f"✅ [DEBUG-TEST] ✅ 成功解析: 翻译长度={len(result.translation)}, 关键词数={len(result.keywords)}")
+            print(f"DEBUG - 🤖 SUCCESS: Dual-task API call completed")
+            print(f"DEBUG - 🤖   - Translation length: {len(result.translation)} chars")
+            print(f"DEBUG - 🤖   - Terms detected: {len(result.keywords)}")
             
             return result
             
         except json.JSONDecodeError as e:
-            print(f"❌ [DEBUG-TEST] ❌ 异常: {e}")
+            print(f"DEBUG - 🤖 ERROR: Failed to parse JSON - {e}")
             print(f"DEBUG - 🤖 Gemini did not return valid JSON format")
             return None
         except Exception as e:
-            print(f"❌ [DEBUG-TEST] ❌ 异常: {e}")
+            print(f"DEBUG - 🤖 ERROR: Parse failed - {e}")
             return None
+
+
 class SEKnowledgeBase:
     """SE terminology knowledge base for real-time explanations
     
@@ -606,6 +597,7 @@ class SEKnowledgeBase:
         
         return None
 
+
 class EmailArchivalService:
     """Email archival service for session transcripts
     
@@ -671,10 +663,8 @@ class EmailArchivalService:
                     ),
                     timeout=10.0  # 10 second timeout to prevent WebSocket blocking
                 )
-                
                 logger.info(f"📧 Session archive sent successfully to {self.recipient_email}")
                 return True
-                
             except asyncio.TimeoutError:
                 logger.warning("📧 Email sending timeout - continuing without blocking WebSocket")
                 return False
@@ -691,86 +681,80 @@ class EmailArchivalService:
         duration_str = f"{session_data.total_duration:.1f} seconds"
         terms_list = ", ".join(session_data.se_terms_detected) if session_data.se_terms_detected else "None detected"
         
-        return f"""
-        <!DOCTYPE html>
-        <html>
-        <head>
-            <style>
-                body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; margin: 0; padding: 20px; background: #f5f5f5; }}
-                .container {{ max-width: 800px; margin: 0 auto; background: white; border-radius: 12px; overflow: hidden; box-shadow: 0 4px 20px rgba(0,0,0,0.1); }}
-                .header {{ background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; padding: 30px; text-align: center; }}
-                .header h1 {{ margin: 0; font-size: 28px; font-weight: 700; }}
-                .header p {{ margin: 10px 0 0; opacity: 0.9; }}
-                .content {{ padding: 30px; }}
-                .section {{ margin-bottom: 30px; }}
-                .section h2 {{ color: #333; font-size: 20px; margin-bottom: 15px; }}
-                .meta-info {{ background: #f8f9fa; padding: 20px; border-radius: 8px; margin-bottom: 20px; }}
-                .meta-item {{ display: flex; justify-content: space-between; margin-bottom: 10px; }}
-                .meta-item:last-child {{ margin-bottom: 0; }}
-                .meta-label {{ font-weight: 600; color: #555; }}
-                .transcript {{ background: #f8f9fa; padding: 20px; border-radius: 8px; border-left: 4px solid #667eea; }}
-                .transcript p {{ margin: 10px 0; line-height: 1.6; }}
-                .se-terms {{ display: flex; flex-wrap: wrap; gap: 8px; }}
-                .se-term {{ background: #667eea; color: white; padding: 4px 12px; border-radius: 20px; font-size: 14px; font-weight: 500; }}
-                .footer {{ background: #f8f9fa; padding: 20px; text-align: center; color: #666; font-size: 14px; }}
-            </style>
-        </head>
-        <body>
-            <div class="container">
-                <div class="header">
-                    <h1>🎓 SE Insight Session Archive</h1>
-                    <p>Real-time SE terminology transcription and analysis</p>
-                </div>
-                
-                <div class="content">
-                    <div class="section">
-                        <h2>📊 Session Information</h2>
-                        <div class="meta-info">
-                            <div class="meta-item">
-                                <span class="meta-label">Session ID:</span>
-                                <span>{session_data.session_id}</span>
-                            </div>
-                            <div class="meta-item">
-                                <span class="meta-label">Start Time:</span>
-                                <span>{session_data.start_time.strftime('%Y-%m-%d %H:%M:%S UTC')}</span>
-                            </div>
-                            <div class="meta-item">
-                                <span class="meta-label">End Time:</span>
-                                <span>{session_data.end_time.strftime('%Y-%m-%d %H:%M:%S UTC') if session_data.end_time else 'N/A'}</span>
-                            </div>
-                            <div class="meta-item">
-                                <span class="meta-label">Duration:</span>
-                                <span>{duration_str}</span>
-                            </div>
-                            <div class="meta-item">
-                                <span class="meta-label">Transcripts:</span>
-                                <span>{len(session_data.transcripts)} segments</span>
-                            </div>
-                        </div>
+        return f"""<!DOCTYPE html>
+<html>
+<head>
+    <style>
+        body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; margin: 0; padding: 20px; background: #f5f5f5; }}
+        .container {{ max-width: 800px; margin: 0 auto; background: white; border-radius: 12px; overflow: hidden; box-shadow: 0 4px 20px rgba(0,0,0,0.1); }}
+        .header {{ background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; padding: 30px; text-align: center; }}
+        .header h1 {{ margin: 0; font-size: 28px; font-weight: 700; }}
+        .header p {{ margin: 10px 0 0; opacity: 0.9; }}
+        .content {{ padding: 30px; }}
+        .section {{ margin-bottom: 30px; }}
+        .section h2 {{ color: #333; font-size: 20px; margin-bottom: 15px; }}
+        .meta-info {{ background: #f8f9fa; padding: 20px; border-radius: 8px; margin-bottom: 20px; }}
+        .meta-item {{ display: flex; justify-content: space-between; margin-bottom: 10px; }}
+        .meta-item:last-child {{ margin-bottom: 0; }}
+        .meta-label {{ font-weight: 600; color: #555; }}
+        .transcript {{ background: #f8f9fa; padding: 20px; border-radius: 8px; border-left: 4px solid #667eea; }}
+        .transcript p {{ margin: 10px 0; line-height: 1.6; }}
+        .se-terms {{ display: flex; flex-wrap: wrap; gap: 8px; }}
+        .se-term {{ background: #667eea; color: white; padding: 4px 12px; border-radius: 20px; font-size: 14px; font-weight: 500; }}
+        .footer {{ background: #f8f9fa; padding: 20px; text-align: center; color: #666; font-size: 14px; }}
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>🎓 SE Insight Session Archive</h1>
+            <p>Real-time SE terminology transcription and analysis</p>
+        </div>
+        <div class="content">
+            <div class="section">
+                <h2>📊 Session Information</h2>
+                <div class="meta-info">
+                    <div class="meta-item">
+                        <span class="meta-label">Session ID:</span>
+                        <span>{session_data.session_id}</span>
                     </div>
-                    
-                    <div class="section">
-                        <h2>🔍 SE Terms Detected</h2>
-                        <div class="se-terms">
-                            {' '.join([f'<span class="se-term">{term}</span>' for term in session_data.se_terms_detected]) if session_data.se_terms_detected else '<p>No SE terminology detected in this session.</p>'}
-                        </div>
+                    <div class="meta-item">
+                        <span class="meta-label">Start Time:</span>
+                        <span>{session_data.start_time.strftime('%Y-%m-%d %H:%M:%S UTC')}</span>
                     </div>
-                    
-                    <div class="section">
-                        <h2>📝 Full Transcript</h2>
-                        <div class="transcript">
-                            {' '.join([f'<p>{transcript}</p>' for transcript in session_data.transcripts]) if session_data.transcripts else '<p>No transcripts available.</p>'}
-                        </div>
+                    <div class="meta-item">
+                        <span class="meta-label">End Time:</span>
+                        <span>{session_data.end_time.strftime('%Y-%m-%d %H:%M:%S UTC') if session_data.end_time else 'N/A'}</span>
                     </div>
-                </div>
-                
-                <div class="footer">
-                    <p>Generated by SE Insight Cloud Edition | {datetime.now().strftime('%Y-%m-%d %H:%M:%S UTC')}</p>
+                    <div class="meta-item">
+                        <span class="meta-label">Duration:</span>
+                        <span>{duration_str}</span>
+                    </div>
+                    <div class="meta-item">
+                        <span class="meta-label">Transcripts:</span>
+                        <span>{len(session_data.transcripts)} segments</span>
+                    </div>
                 </div>
             </div>
-        </body>
-        </html>
-        """
+            <div class="section">
+                <h2>🔍 SE Terms Detected</h2>
+                <div class="se-terms">
+                    {' '.join([f'<span class="se-term">{term}</span>' for term in session_data.se_terms_detected]) if session_data.se_terms_detected else '<p>No SE terminology detected in this session.</p>'}
+                </div>
+            </div>
+            <div class="section">
+                <h2>📝 Full Transcript</h2>
+                <div class="transcript">
+                    {' '.join([f'<p>{transcript}</p>' for transcript in session_data.transcripts]) if session_data.transcripts else '<p>No transcripts available.</p>'}
+                </div>
+            </div>
+        </div>
+        <div class="footer">
+            <p>Generated by SE Insight Railway Edition | {datetime.now().strftime('%Y-%m-%d %H:%M:%S UTC')}</p>
+        </div>
+    </div>
+</body>
+</html>"""
 
 def resample_audio(audio_data: bytes, from_rate: int, to_rate: int = 16000, channels: int = 1) -> bytes:
     """Forcefully resample arbitrary audio (44.1k/48k/Stereo) to Google-compliant 16k Mono.
@@ -796,43 +780,31 @@ def resample_audio(audio_data: bytes, from_rate: int, to_rate: int = 16000, chan
         resampled = np.interp(indices, np.arange(length), audio_array.astype(float))
         
         return resampled.astype(np.int16).tobytes()
-        
     except Exception as e:
         logger.error(f"❌ Resampling failed: {e}")
         return audio_data  # Fallback
 
+
 class GoogleSpeechClient:
-    """Google Speech API client - Google Cloud Run optimized
+    """Google Speech API client - Railway deployment optimized
     
-    Uses Application Default Credentials (ADC) when running on Google Cloud,
-    falls back to GCP_KEY_JSON for local development or other environments.
+    Task 3: MUST use speech_v1.SpeechAsyncClient for async generator compatibility
     """
     
     def __init__(self):
         self.client = None
         self.audio_config = AudioConfig()
         self.setup_client()
-        
+    
     def setup_client(self):
-        """Initialize Google Speech client with ADC first, fallback to JSON credentials"""
+        """Initialize Google Speech client directly from JSON string (No temp files)"""
         if not GOOGLE_CLOUD_AVAILABLE:
             logger.error("❌ Google Cloud Speech API v1 not available")
             return
         
-        # Try Application Default Credentials first (for Google Cloud Run)
-        try:
-            logger.info("🔄 Attempting to initialize Google Speech client with Application Default Credentials...")
-            self.client = speech.SpeechAsyncClient()
-            logger.info("✅ Google Speech v1 AsyncClient initialized with ADC (Google Cloud Run)")
-            return
-        except Exception as adc_error:
-            logger.warning(f"⚠️ ADC initialization failed: {adc_error}")
-            logger.info("🔄 Falling back to GCP_KEY_JSON credentials...")
-        
-        # Fallback to GCP_KEY_JSON for local development or Railway
         gcp_key_json = os.environ.get('GCP_KEY_JSON')
         if not gcp_key_json:
-            logger.error("❌ GCP_KEY_JSON environment variable is missing and ADC failed")
+            logger.error("❌ GCP_KEY_JSON environment variable is missing")
             self.client = None
             return
         
@@ -847,14 +819,16 @@ class GoogleSpeechClient:
             service_account_info = json.loads(gcp_key_json)
             
             # Create credentials object directly from info
-            credentials = service_account.Credentials.from_service_account_info(service_account_info)
+            credentials = service_account.Credentials.from_service_account_info(
+                service_account_info
+            )
             
             # Initialize client with explicit credentials
             self.client = speech.SpeechAsyncClient(credentials=credentials)
-            logger.info("✅ Google Speech v1 AsyncClient initialized with JSON credentials (Fallback)")
+            logger.info("✅ Google Speech v1 AsyncClient initialized successfully (Memory Auth)")
             
         except Exception as e:
-            logger.error(f"❌ Failed to initialize Google Client with both ADC and JSON: {e}")
+            logger.error(f"❌ Failed to initialize Google Client: {e}")
             self.client = None
     
     def get_recognition_config(self):
@@ -895,7 +869,7 @@ active_sessions: Dict[str, SessionData] = {}
 
 # FastAPI application with SE Insight configuration
 app = FastAPI(
-    title="SE Insight Cloud Backend",
+    title="SE Insight Railway Backend",
     description="Real-time SE terminology transcription with Google Speech API",
     version="1.0.0",
     docs_url="/docs",
@@ -938,15 +912,11 @@ async def options_handler(path: str):
 @app.get("/")
 async def root():
     """Root endpoint with SE Insight service information"""
-    # Detect environment
-    environment = "Google Cloud Run" if os.environ.get('K_SERVICE') else "Local/Other"
-    
     return {
-        "service": "SE Insight Cloud Backend",
+        "service": "SE Insight Railway Backend",
         "version": "1.0.0",
         "status": "running",
         "project": "upm-se-assistant",
-        "environment": environment,
         "features": {
             "google_speech_api": GOOGLE_CLOUD_AVAILABLE,
             "real_time_transcription": True,
@@ -957,18 +927,13 @@ async def root():
 
 @app.get("/health")
 async def health_check():
-    """Health check endpoint for Google Cloud Run deployment monitoring"""
-    # Detect authentication method
-    auth_method = "ADC" if not os.environ.get('GCP_KEY_JSON') else "JSON Credentials"
-    environment = "Google Cloud Run" if os.environ.get('K_SERVICE') else "Local/Other"
-    
+    """Health check endpoint for Railway deployment monitoring"""
     return {
         "status": "healthy",
         "timestamp": time.time(),
-        "environment": environment,
         "google_api_available": GOOGLE_CLOUD_AVAILABLE,
         "client_initialized": google_client.client is not None,
-        "auth_method": auth_method,
+        "gcp_key_configured": bool(os.environ.get('GCP_KEY_JSON')),
         "project": "upm-se-assistant",
         "features": {
             "se_knowledge_base": len(se_knowledge_base.knowledge_graph),
@@ -981,42 +946,6 @@ async def health_check():
             "channels": google_client.audio_config.channels,
             "bit_depth": google_client.audio_config.bit_depth
         }
-    }
-
-@app.post("/transcript")
-async def handle_automated_validation(data: Dict[str, str]):
-    """Automated validation endpoint for Katalon batch testing
-    
-    This endpoint enables quantitative thesis data collection by processing
-    transcript text through the Gemini dual-task service (translation + SE term detection).
-    
-    Required for TC_2and3_GoldenSet_Verification script to calculate Explanation_Score.
-    """
-    # Extract the input text from the JSON payload
-    input_text = data.get("text")
-    if not input_text:
-        raise HTTPException(status_code=400, detail="Missing required 'text' field")
-    
-    # 🔧 [FIX] Use test-specific service with rate limit bypass
-    analysis = await gemini_service.analyze_transcript(input_text)
-    
-    if not analysis:
-        # Add detailed error information
-        logger.error(f"❌ Gemini test service returned None for: {input_text[:50]}")
-        return {
-            "original_text": input_text,
-            "translation": "Service Unavailable - Check server logs",
-            "keywords": []
-        }
-    
-    # Return structured data for the Katalon validation script
-    return {
-        "original_text": analysis.original_text,
-        "translation": analysis.translation,
-        "keywords": [
-            {"term": kw.term, "explanation": kw.explanation}
-            for kw in analysis.keywords
-        ]
     }
 
 @app.get("/api/se-terms")
@@ -1055,7 +984,7 @@ async def get_se_term_definition(term: str):
 async def language_check():
     """Verify that all system messages are in English"""
     return {
-        "project_name": "SE Insight Cloud Backend",
+        "project_name": "SE Insight Railway Backend",
         "target_audience": "Chinese students in English-taught software engineering courses",
         "code_language": "English",
         "output_language": "Chinese translations from Gemini",
@@ -1113,7 +1042,6 @@ async def test_gemini_design_api():
     ]
     
     results = []
-    
     for transcript in test_transcripts:
         try:
             print(f"DEBUG - 🤖 Testing API design with: {transcript}")
@@ -1173,6 +1101,7 @@ async def test_gemini_design_api():
         "expected_workflow": "Audio → Google Speech → English transcript → Gemini API → [Chinese translation + SE term explanations]"
     }
 
+
 @app.websocket("/ws/debug")
 async def websocket_debug_endpoint(websocket: WebSocket):
     """Debug WebSocket endpoint for simple audio testing without Google Speech API"""
@@ -1199,13 +1128,12 @@ async def websocket_debug_endpoint(websocket: WebSocket):
                                 "timestamp": time.time()
                             })
                             print(f"DEBUG - 🔧 Debug config received: {sample_rate}Hz, {channels}ch")
-                            
                     except json.JSONDecodeError as e:
                         await websocket.send_json({
                             "type": "debug_error", 
                             "message": f"Invalid JSON: {e}"
                         })
-                        
+                
                 elif "bytes" in msg:
                     audio_data = msg["bytes"]
                     await websocket.send_json({
@@ -1265,6 +1193,7 @@ async def websocket_audio_stream(websocket: WebSocket):
                 transcript = await gemini_queue.get()
                 if transcript is None:  # Stop signal
                     break
+                
                 print(f"DEBUG - 🤖 Processing Gemini analysis for: {transcript}")
                 await send_gemini_analysis(transcript, websocket)
                 gemini_queue.task_done()
@@ -1295,7 +1224,7 @@ async def websocket_audio_stream(websocket: WebSocket):
                 sample_rate_hertz=16000,  # Fixed 16kHz
                 audio_channel_count=1,    # Mono channel
                 language_code="en-US",
-                model="latest_long",  # Best compatibility model
+                model="latest_long",  # Best compatibility mode
                 enable_automatic_punctuation=True,
                 enable_word_time_offsets=False,  # Simplify config, improve performance
                 speech_contexts=[
@@ -1338,6 +1267,7 @@ async def websocket_audio_stream(websocket: WebSocket):
                     try:
                         # Use shorter timeout for faster response
                         data = await asyncio.wait_for(audio_queue.get(), timeout=0.1)  # Faster response
+                        
                         if data is None:  # Received termination signal
                             print("DEBUG - Audio queue closed, ending stream")
                             break
@@ -1348,7 +1278,7 @@ async def websocket_audio_stream(websocket: WebSocket):
                         if len(chunk_buffer) >= BUFFER_THRESHOLD:
                             yield speech.StreamingRecognizeRequest(audio_content=bytes(chunk_buffer))
                             chunk_buffer.clear()
-                            
+                    
                     except asyncio.TimeoutError:
                         # Send partial buffer on timeout
                         if len(chunk_buffer) > 0:
@@ -1365,6 +1295,7 @@ async def websocket_audio_stream(websocket: WebSocket):
             # Call Google Speech API with correct retry configuration
             try:
                 from google.api_core import exceptions as google_exceptions
+                
                 responses = await google_client.client.streaming_recognize(
                     requests=requests,
                     retry=retries.AsyncRetry(
@@ -1377,8 +1308,10 @@ async def websocket_audio_stream(websocket: WebSocket):
                         maximum=3.0  # Maximum 3 retries
                     )
                 )
+                
                 print("DEBUG - ✅ Google stream created successfully")
                 return responses
+                
             except Exception as e:
                 error_msg = f"Failed to create Google stream: {str(e)}"
                 print(f"🔥 {error_msg}")
@@ -1396,10 +1329,12 @@ async def websocket_audio_stream(websocket: WebSocket):
                 "message": f"Configuration error: {str(e)[:200]}"
             })
             return None
+
     
     async def listen_to_google_stream(responses, session_data):
         """Listen to Google Speech responses and send to client"""
         print("DEBUG - 👂 Listening for transcription...")
+        
         try:
             async for response in responses:
                 if not response.results:
@@ -1482,7 +1417,7 @@ async def websocket_audio_stream(websocket: WebSocket):
                                 print(f"DEBUG - 🤖 Gemini queue full, dropping analysis for: {transcript}")
                         else:
                             print(f"DEBUG - 🤖 Skipping Gemini (content criteria not met): {transcript}")
-                        
+        
         except Exception as e:
             error_msg = str(e)
             print(f"🔥 Google API stream error: {error_msg}")
@@ -1502,6 +1437,7 @@ async def websocket_audio_stream(websocket: WebSocket):
                 })
             except:
                 pass
+            
             return False
         
         print("DEBUG - Google stream completed")
@@ -1686,7 +1622,6 @@ async def websocket_audio_stream(websocket: WebSocket):
                                 gemini_queue.put_nowait(text)
                             except asyncio.QueueFull:
                                 print(f"DEBUG - 🤖 Gemini队列满，跳过分析")
-                        
                         continue
                     
                     # 🔥 新增：处理完整句子消息
@@ -1703,7 +1638,6 @@ async def websocket_audio_stream(websocket: WebSocket):
                                 print(f"DEBUG - 🤖 完整句子已加入Gemini分析队列")
                             except asyncio.QueueFull:
                                 print(f"DEBUG - 🤖 Gemini队列满，跳过完整句子分析")
-                        
                         continue
                     
                     # 原有的start_session处理
@@ -1748,7 +1682,7 @@ async def websocket_audio_stream(websocket: WebSocket):
                             asyncio.create_task(start_recognition_stream())
                         else:
                             print("DEBUG - ⚠️ Recognition already started")
-                            
+                
                 except json.JSONDecodeError as e:
                     print(f"DEBUG - ❌ Invalid JSON received: {e}")
                     continue
@@ -1765,7 +1699,12 @@ async def websocket_audio_stream(websocket: WebSocket):
                 try:
                     # 🔧 [CRITICAL FIX] Resample BEFORE Queueing
                     # Use frontend_sample_rate received from handshake (default 48000 to be safe)
-                    processed_audio = resample_audio(msg["bytes"], from_rate=frontend_sample_rate or 48000, to_rate=16000, channels=frontend_channels or 1)
+                    processed_audio = resample_audio(
+                        msg["bytes"], 
+                        from_rate=frontend_sample_rate or 48000, 
+                        to_rate=16000, 
+                        channels=frontend_channels or 1
+                    )
                     
                     # Put PROCESSED (16k) audio into queue
                     await asyncio.wait_for(audio_queue.put(processed_audio), timeout=1.0)
@@ -1775,7 +1714,7 @@ async def websocket_audio_stream(websocket: WebSocket):
                 except Exception as e:
                     print(f"DEBUG - ❌ Error processing audio: {e}")
                     continue
-                
+    
     except WebSocketDisconnect:
         logger.info(f"🔌 Client Disconnected: {client_id}")
     except Exception as e:
@@ -1830,47 +1769,23 @@ async def websocket_audio_stream(websocket: WebSocket):
         
         # Send email archive (non-blocking)
         if email_service.is_configured and session_data.transcripts:
-            logger.info(f"📧 Attempting to send email archive to {email_service.recipient_email}")
-            logger.info(f"📊 Session summary: {len(session_data.transcripts)} transcripts, {len(session_data.se_terms_detected)} SE terms")
             try:
-                email_sent = await email_service.send_session_archive(session_data)
-                if email_sent:
-                    logger.info("✅ Email archive sent successfully")
-                else:
-                    logger.warning("⚠️ Email archive failed to send")
+                await email_service.send_session_archive(session_data)
             except Exception as e:
-                logger.error(f"❌ Email archival failed: {e}")
-                import traceback
-                traceback.print_exc()
-        else:
-            if not email_service.is_configured:
-                logger.warning("⚠️ Email service not configured - skipping archive")
-                logger.info(f"📋 Required env vars: EMAIL_USER={bool(os.environ.get('EMAIL_USER'))}, EMAIL_PASSWORD={bool(os.environ.get('EMAIL_PASSWORD'))}, RECIPIENT_EMAIL={bool(os.environ.get('RECIPIENT_EMAIL'))}")
-            if not session_data.transcripts:
-                logger.info("📝 No transcripts to archive")
+                print(f"DEBUG - ❌ Email archival failed: {e}")
         
         # Cleanup session
         if client_id in active_sessions:
             del active_sessions[client_id]
 
 if __name__ == "__main__":
-    # Production deployment - Google Cloud Run uses $PORT, this is for local development
-    port = int(os.environ.get("PORT", 8080))  # Cloud Run injects PORT, fallback to 8080 for local
+    # Production deployment - Railway uses Procfile, this is for local development only
+    port = int(os.environ.get("PORT", 8080))  # Railway default port, fallback for local development
     
-    # Detect environment
-    is_cloud_run = bool(os.environ.get('K_SERVICE'))
-    environment = "Google Cloud Run" if is_cloud_run else "Local Development"
-    
-    logger.info(f"Starting SE Insight Cloud Backend - {environment}")
-    logger.info(f"Port: {port}")
+    logger.info("Starting SE Insight Railway Backend")
+    logger.info(f"Port: {port} (Railway: {bool(os.environ.get('RAILWAY_ENVIRONMENT'))})")
     logger.info(f"Google API: {'Available' if GOOGLE_CLOUD_AVAILABLE else 'Not Available'}")
-    
-    # Log authentication method
-    if os.environ.get('GCP_KEY_JSON'):
-        logger.info("Auth: Using GCP_KEY_JSON credentials")
-    else:
-        logger.info("Auth: Using Application Default Credentials (ADC)")
-    
+    logger.info(f"GCP Key: {'Configured' if os.environ.get('GCP_KEY_JSON') else 'Not Configured'}")
     logger.info(f"Gemini API: {'Configured' if os.environ.get('GEMINI_API_KEY') else 'Not Configured'}")
     logger.info(f"Email Service: {'Configured' if email_service.is_configured else 'Not Configured'}")
     
