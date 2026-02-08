@@ -117,9 +117,9 @@ class GeminiAPIService:
         # Add real-time sending flag
         self.realtime_mode = True  # Default to real-time mode
         
-        # 🔧 [FIX] Test mode optimization for rate limiting
-        self.test_mode = os.environ.get('KATALON_TEST_MODE', 'false').lower() == 'true'
-        self.min_interval = 0.0 if self.test_mode else 2.0
+        # 🔧 [FIX] Disable rate limiting completely to restore basic functionality
+        self.test_mode = True
+        self.min_interval = 0.0
         
         # Update system_instruction in GeminiAPIService.__init__()
         self.system_instruction = """You are a Senior Software Engineering Professor analyzing software engineering conversations.
