@@ -162,7 +162,7 @@ Now analyze this transcript:"""
         
         # Buffer mechanism to prevent too-frequent API calls (15 RPM rate limit)
         self.last_analysis_time = 0
-        self.min_interval = 2.0  # Minimum 2 seconds between Gemini API calls (stays within 15 RPM)
+        self.min_interval = 0.0  # Set to 0.0 for immediate processing without buffering
         self.pending_transcripts = []
         
         self.is_configured = True
