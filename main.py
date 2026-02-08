@@ -117,6 +117,10 @@ class GeminiAPIService:
         # Add real-time sending flag
         self.realtime_mode = True  # Default to real-time mode
         
+        # 🔧 [FIX] Test mode optimization for rate limiting
+        self.test_mode = os.environ.get('KATALON_TEST_MODE', 'false').lower() == 'true'
+        self.min_interval = 0.0 if self.test_mode else 2.0
+        
         # Update system_instruction in GeminiAPIService.__init__()
         self.system_instruction = """You are a Senior Software Engineering Professor analyzing software engineering conversations.
 
@@ -162,11 +166,10 @@ Now analyze this transcript:"""
         
         # Buffer mechanism to prevent too-frequent API calls (15 RPM rate limit)
         self.last_analysis_time = 0
-        self.min_interval = 2.0  # Minimum 2 seconds between Gemini API calls (stays within 15 RPM)
         self.pending_transcripts = []
         
         self.is_configured = True
-        logger.info(f"✅ Gemini API service configured with gemini-2.0-flash for real-time SE term explanations (realtime_mode={self.realtime_mode})")
+        logger.info(f"✅ Gemini API service configured with gemini-2.0-flash (rate limit: {self.min_interval}s)")
     
     async def analyze_transcript(self, transcript_text: str) -> Optional[GeminiAnalysisResult]:
         """Analyze transcript for SE terms and provide Chinese explanations
@@ -191,12 +194,21 @@ Now analyze this transcript:"""
         if not self.is_configured or not transcript_text.strip():
             return None
         
-        # Buffer mechanism: Only call Gemini API every 2+ seconds
+        # Buffer mechanism: Only call Gemini API based on interval
         current_time = time.time()
-        if current_time - self.last_analysis_time < self.min_interval:
-            logger.debug(f"⏰ Gemini API call buffered - waiting {self.min_interval}s interval")
-            self.pending_transcripts.append(transcript_text)
-            return None
+        time_since_last = current_time - self.last_analysis_time
+        
+        if time_since_last < self.min_interval:
+            if self.test_mode:
+                # Test mode: No buffering, process immediately
+                logger.info(f"🧪 TEST MODE: Processing request {time_since_last:.2f}s after last")
+                # Continue to process immediately, don't buffer
+            else:
+                # Production mode: Buffer requests
+                wait_time = self.min_interval - time_since_last
+                logger.debug(f"⏰ Gemini API call buffered - waiting {wait_time:.2f}s")
+                self.pending_transcripts.append(transcript_text)
+                return None
         
         # Process accumulated transcripts
         if self.pending_transcripts:
@@ -276,7 +288,8 @@ Now analyze this transcript:"""
     
     async def _parse_gemini_response(self, response_data: dict, original_text: str) -> Optional[GeminiAnalysisResult]:
         """Parse Gemini API response - expects ONE call to do TWO tasks"""
-        print(f"DEBUG - 🤖 Parsing Gemini response - Checking for dual-task completion")
+        print(f"✅ [DEBUG-TEST] 开始解析Gemini响应")
+        print(f"✅ [DEBUG-TEST] 原始文本长度: {len(original_text)}")
         
         try:
             # Extract response text
@@ -332,18 +345,16 @@ Now analyze this transcript:"""
                 ]
             )
             
-            print(f"DEBUG - 🤖 SUCCESS: Dual-task API call completed")
-            print(f"DEBUG - 🤖   - Translation length: {len(result.translation)} chars")
-            print(f"DEBUG - 🤖   - Terms detected: {len(result.keywords)}")
+            print(f"✅ [DEBUG-TEST] ✅ 成功解析: 翻译长度={len(result.translation)}, 关键词数={len(result.keywords)}")
             
             return result
             
         except json.JSONDecodeError as e:
-            print(f"DEBUG - 🤖 ERROR: Failed to parse JSON - {e}")
+            print(f"❌ [DEBUG-TEST] ❌ 异常: {e}")
             print(f"DEBUG - 🤖 Gemini did not return valid JSON format")
             return None
         except Exception as e:
-            print(f"DEBUG - 🤖 ERROR: Parse failed - {e}")
+            print(f"❌ [DEBUG-TEST] ❌ 异常: {e}")
             return None
 class SEKnowledgeBase:
     """SE terminology knowledge base for real-time explanations
@@ -970,6 +981,42 @@ async def health_check():
             "channels": google_client.audio_config.channels,
             "bit_depth": google_client.audio_config.bit_depth
         }
+    }
+
+@app.post("/transcript")
+async def handle_automated_validation(data: Dict[str, str]):
+    """Automated validation endpoint for Katalon batch testing
+    
+    This endpoint enables quantitative thesis data collection by processing
+    transcript text through the Gemini dual-task service (translation + SE term detection).
+    
+    Required for TC_2and3_GoldenSet_Verification script to calculate Explanation_Score.
+    """
+    # Extract the input text from the JSON payload
+    input_text = data.get("text")
+    if not input_text:
+        raise HTTPException(status_code=400, detail="Missing required 'text' field")
+    
+    # 🔧 [FIX] Use test-specific service with rate limit bypass
+    analysis = await gemini_service.analyze_transcript(input_text)
+    
+    if not analysis:
+        # Add detailed error information
+        logger.error(f"❌ Gemini test service returned None for: {input_text[:50]}")
+        return {
+            "original_text": input_text,
+            "translation": "Service Unavailable - Check server logs",
+            "keywords": []
+        }
+    
+    # Return structured data for the Katalon validation script
+    return {
+        "original_text": analysis.original_text,
+        "translation": analysis.translation,
+        "keywords": [
+            {"term": kw.term, "explanation": kw.explanation}
+            for kw in analysis.keywords
+        ]
     }
 
 @app.get("/api/se-terms")
@@ -1783,10 +1830,24 @@ async def websocket_audio_stream(websocket: WebSocket):
         
         # Send email archive (non-blocking)
         if email_service.is_configured and session_data.transcripts:
+            logger.info(f"📧 Attempting to send email archive to {email_service.recipient_email}")
+            logger.info(f"📊 Session summary: {len(session_data.transcripts)} transcripts, {len(session_data.se_terms_detected)} SE terms")
             try:
-                await email_service.send_session_archive(session_data)
+                email_sent = await email_service.send_session_archive(session_data)
+                if email_sent:
+                    logger.info("✅ Email archive sent successfully")
+                else:
+                    logger.warning("⚠️ Email archive failed to send")
             except Exception as e:
-                print(f"DEBUG - ❌ Email archival failed: {e}")
+                logger.error(f"❌ Email archival failed: {e}")
+                import traceback
+                traceback.print_exc()
+        else:
+            if not email_service.is_configured:
+                logger.warning("⚠️ Email service not configured - skipping archive")
+                logger.info(f"📋 Required env vars: EMAIL_USER={bool(os.environ.get('EMAIL_USER'))}, EMAIL_PASSWORD={bool(os.environ.get('EMAIL_PASSWORD'))}, RECIPIENT_EMAIL={bool(os.environ.get('RECIPIENT_EMAIL'))}")
+            if not session_data.transcripts:
+                logger.info("📝 No transcripts to archive")
         
         # Cleanup session
         if client_id in active_sessions:
