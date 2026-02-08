@@ -160,9 +160,9 @@ EXAMPLE OUTPUT:
 
 Now analyze this transcript:"""
         
-        # Buffer mechanism to prevent too-frequent API calls (15 RPM rate limit)
+        # Immediate processing without buffering for Cloud Run deployment
         self.last_analysis_time = 0
-        self.min_interval = 0.0  # Set to 0.0 for immediate processing without buffering
+        self.min_interval = 0.0  # Process every transcript immediately
         self.pending_transcripts = []
         
         self.is_configured = True
